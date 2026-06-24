@@ -7,40 +7,33 @@ import os
 import time
 import quopri
 import base64
+import hashlib
 import ipaddress
-from urllib.parse import urlparse, quote
-
 import requests
+import tldextract
+from urllib.parse import urlparse, quote
 from email.parser import HeaderParser
 from email.header import decode_header
 from email.utils import parsedate_to_datetime, parseaddr
-from datetime import timezone, date
+from datetime import timezone
 from dotenv import load_dotenv
 
 load_dotenv()
 
-try:
-    import tldextract
-    _TLD_EXTRACT = tldextract.TLDExtract(suffix_list_urls=())
-except Exception:
-    _TLD_EXTRACT = None
+# --- Config -------------------------------------------------------------------
 
-_MULTI_SUFFIXES = {
-    'co.uk', 'org.uk', 'gov.uk', 'ac.uk', 'me.uk', 'ltd.uk', 'plc.uk',
-    'co.jp', 'or.jp', 'ne.jp', 'ac.jp', 'go.jp',
-    'com.au', 'net.au', 'org.au', 'edu.au', 'gov.au',
-    'co.nz', 'org.nz', 'com.br', 'com.mx', 'com.tr', 'com.cn',
-    'co.in', 'co.za', 'co.kr', 'com.sg', 'com.hk',
-}
+_TLD_EXTRACT = tldextract.TLDExtract(suffix_list_urls=())
 
-# --- Network / API config -----------------------------------------------------
 URLSCAN_SUBMIT_THROTTLE = 2
 URLSCAN_POLL_INTERVAL = 4
-URLSCAN_MAX_WAIT = 90
+URLSCAN_MAX_WAIT = 60
 HTTP_TIMEOUT = 30
 
 VT_THROTTLE = 15
-VT_MAX_LOOKUPS = 8
+VT_MAX_LOOKUPS = 3
+VT_REANALYZE = True
+VT_REANALYZE_POLL = 4
+VT_REANALYZE_MAX_WAIT = 45
 ABUSEIPDB_MAX_AGE_DAYS = 90
 ABUSEIPDB_MAX_IPS = 15
 
@@ -49,31 +42,37 @@ _ALLOWED_API_HOSTS = (
     'www.virustotal.com', 'api.abuseipdb.com',
 )
 
-# --- Verdict thresholds -------------------------------------------------------
 SCORE_SUSPICIOUS = 10
 SCORE_MALICIOUS = 50
-RECENT_DAYS = 90
-OTX_SUSPICIOUS_PULSES = 3
+OTX_SUSPICIOUS_PULSES = 1
 ABUSE_SUSPICIOUS = 25
 ABUSE_MALICIOUS = 75
 
-NOISE_HOSTS = {
-    "w3.org", "www.w3.org", "schema.org", "schemas.microsoft.com",
-    "schemas.xmlsoap.org", "purl.org", "ns.adobe.com",
+# Display label for every verdict — single source of truth for the tags.
+_LABELS = {
+    "Clean": "CLEAN ✅",
+    "Suspicious": "SUSPICIOUS ⚠️",
+    "NeedsReview": "NEEDS REVIEW 👀",
+    "Malicious": "MALICIOUS 📛",
+    "WhitelistSkip": "SKIPPED ⏭️",
+    "Unknown": "UNKNOWN ❔",
 }
+
+# Which OSINT tool produces each kind of signal (used for the dynamic flags).
+SRC_OTX = "AlienVault OTX"
+SRC_URLSCAN = "URLScan.io"
+SRC_GSB = "Google Safe Browsing"
+SRC_VT = "VirusTotal"
+SRC_ABUSE = "AbuseIPDB"
 
 
 # --- Safe transport -----------------------------------------------------------
 
-def _host_allowed(url):
-    host = (urlparse(url).hostname or '').lower()
-    return any(host == a or host.endswith('.' + a) for a in _ALLOWED_API_HOSTS)
-
-
 def _safe_request(method, url, **kwargs):
     """Single choke point for ALL outbound traffic. Refuses non-API hosts so the
     tool can never be tricked into fetching a target URL directly."""
-    if not _host_allowed(url):
+    host = (urlparse(url).hostname or '').lower()
+    if not any(host == a or host.endswith('.' + a) for a in _ALLOWED_API_HOSTS):
         raise ValueError(f"Blocked request to non-API host: {url}")
     kwargs.setdefault('timeout', HTTP_TIMEOUT)
     return requests.request(method, url, **kwargs)
@@ -85,10 +84,8 @@ def defang(text):
     if not text or text == "Not Found":
         return text
     text = re.sub(r'(?i)http', 'hxxp', text)
-
-    def defang_ip(match):
-        return match.group(0).replace('.', '[.]')
-    text = re.sub(r'\b(?:\d{1,3}\.){3}\d{1,3}\b', defang_ip, text)
+    text = re.sub(r'\b(?:\d{1,3}\.){3}\d{1,3}\b',
+                  lambda m: m.group(0).replace('.', '[.]'), text)
     text = re.sub(r'(?<!\bheader)(?<!\bsmtp)(?<!\bcompauth)\.(?=[a-zA-Z]{2,}\b)', '[.]', text)
     return text
 
@@ -96,18 +93,16 @@ def defang(text):
 def decode_mime_words(header_string):
     if not header_string:
         return "Not Found"
-    decoded_words = decode_header(header_string)
-    final_string = ""
-    for word, encoding in decoded_words:
+    final = ""
+    for word, encoding in decode_header(header_string):
         if isinstance(word, bytes):
-            charset = encoding if encoding else "utf-8"
             try:
-                final_string += word.decode(charset)
+                final += word.decode(encoding or "utf-8")
             except (LookupError, UnicodeDecodeError):
-                final_string += word.decode("utf-8", errors="replace")
+                final += word.decode("utf-8", errors="replace")
         else:
-            final_string += word
-    return " ".join(final_string.split())
+            final += word
+    return " ".join(final.split())
 
 
 def convert_to_utc(date_string):
@@ -124,39 +119,25 @@ def convert_to_utc(date_string):
 
 def get_status_emoji(status):
     status = status.lower()
-    if status == 'pass':
-        return f"{status} ✅"
-    elif status == 'fail':
-        return f"{status} ❌"
-    elif status == 'softfail':
-        return f"{status} ⚠️"
-    elif status in ['temperror', 'permerror']:
-        return f"{status} 🛠️"
-    elif status in ['none', 'neutral']:
-        return f"{status} ❔"
-    else:
-        return f"{status if status else 'unknown'} ➖"
+    return {
+        'pass': f"{status} ✅", 'fail': f"{status} ❌", 'softfail': f"{status} ⚠️",
+        'temperror': f"{status} 🛠️", 'permerror': f"{status} 🛠️",
+        'none': f"{status} ❔", 'neutral': f"{status} ❔",
+    }.get(status, status or 'unknown')
 
 
 def parse_auth_results(auth_header):
     if not auth_header or auth_header == "Not Found":
         return "None ❔"
-    parts = [p.strip() for p in auth_header.split(';') if p.strip()]
-    formatted_lines = []
-    for part in parts:
-        match = re.search(r'^(spf|dkim|dmarc|compauth|arc)=([a-zA-Z0-9]+)', part, re.IGNORECASE)
-        if match:
-            protocol = match.group(1).lower()
-            status_word = match.group(2).lower()
-            formatted_status = get_status_emoji(status_word)
-            clean_part = re.sub(
-                r'^(spf|dkim|dmarc|compauth|arc)=[a-zA-Z0-9]+',
-                f"{protocol}={formatted_status}", part, flags=re.IGNORECASE,
-            )
-            formatted_lines.append("* " + clean_part)
-        else:
-            formatted_lines.append("* " + part)
-    return defang("\n".join(formatted_lines))
+    lines = []
+    for part in (p.strip() for p in auth_header.split(';') if p.strip()):
+        m = re.search(r'^(spf|dkim|dmarc|compauth|arc)=([a-zA-Z0-9]+)', part, re.IGNORECASE)
+        if m:
+            proto, status = m.group(1).lower(), m.group(2).lower()
+            part = re.sub(r'^(spf|dkim|dmarc|compauth|arc)=[a-zA-Z0-9]+',
+                          f"{proto}={get_status_emoji(status)}", part, flags=re.IGNORECASE)
+        lines.append("* " + part)
+    return defang("\n".join(lines))
 
 
 def extract_domain(email_address):
@@ -166,6 +147,18 @@ def extract_domain(email_address):
     if '@' in addr:
         return addr.split('@')[-1].strip().lower() or None
     return None
+
+
+def verdict_label(v):
+    return _LABELS.get(v, _LABELS["Unknown"])
+
+
+def _join(sources):
+    """'A' / 'A and B' / 'A, B and C' — for the dynamic 'Flagged by ...' text."""
+    sources = list(dict.fromkeys(s for s in sources if s))
+    if len(sources) <= 1:
+        return sources[0] if sources else ""
+    return ", ".join(sources[:-1]) + " and " + sources[-1]
 
 
 # --- Observable filtering -----------------------------------------------------
@@ -206,38 +199,24 @@ def registrable_domain(host):
     host = host.split(':')[0].strip().lower().rstrip('.')
     if _is_ip(host):
         return host
-    if _TLD_EXTRACT is not None:
-        ext = _TLD_EXTRACT(host)
-        if ext.domain and ext.suffix:
-            return f"{ext.domain}.{ext.suffix}"
-        return None
-    parts = host.split('.')
-    if len(parts) < 2:
-        return None
-    last2 = '.'.join(parts[-2:])
-    if len(parts) >= 3 and last2 in _MULTI_SUFFIXES:
-        return '.'.join(parts[-3:])
-    return last2
+    ext = _TLD_EXTRACT(host)
+    if ext.domain and ext.suffix:
+        return f"{ext.domain}.{ext.suffix}"
+    return None
 
 
 def is_scannable(observable):
     host = extract_host(observable)
-    if not host:
-        return False
-    if host in NOISE_HOSTS:
-        return False
-    if _is_private_ip(host):
+    if not host or _is_private_ip(host):
         return False
     if _is_ip(host):
         return True
     if not _HOSTNAME_RE.match(host):
         return False
-    if host.endswith(('.local', '.internal', '.lan', '.localdomain', '.home.arpa')):
-        return False
-    return True
+    return not host.endswith(('.local', '.internal', '.lan', '.localdomain', '.home.arpa'))
 
 
-# --- Date helpers -------------------------------------------------------------
+# --- RDAP creation date -------------------------------------------------------
 
 def _normalize_date(value):
     if isinstance(value, list) and value:
@@ -276,9 +255,7 @@ def _search_creation_date(node):
 
     walk(node)
     dated = [d for d in found if _DATE_RE.match(d)]
-    if dated:
-        return min(dated)
-    return found[0] if found else None
+    return min(dated) if dated else (found[0] if found else None)
 
 
 def _iso_to_ddmmyyyy(iso):
@@ -288,15 +265,6 @@ def _iso_to_ddmmyyyy(iso):
         y, m, d = iso.split('-')
         return f"{d}-{m}-{y}"
     return iso
-
-
-def _age_days(iso):
-    if not iso or not _DATE_RE.match(iso):
-        return None
-    try:
-        return (date.today() - date.fromisoformat(iso)).days
-    except (TypeError, ValueError):
-        return None
 
 
 _RDAP_CACHE = {}
@@ -319,78 +287,42 @@ def rdap_creation_date(apex_domain):
     return result
 
 
-def creation_date_iso(res_data, apex=None):
-    date_iso = None
-    if isinstance(res_data, dict):
-        meta = res_data.get('meta')
-        date_iso = _search_creation_date(meta) if meta else None
-        if not date_iso:
-            for key in ('whois', 'rdap'):
-                date_iso = _search_creation_date(res_data.get(key))
-                if date_iso:
-                    break
-        if not apex:
-            apex = ((res_data.get('page') or {}).get('apexDomain')
-                    or (res_data.get('task') or {}).get('apexDomain'))
-    if not date_iso and apex:
-        date_iso = rdap_creation_date(apex)
-    return date_iso
-
-
 # --- URLScan.io ---------------------------------------------------------------
 
 def _urlscan_headers():
-    key = os.getenv('URLSCAN_DAEMON')
-    return {'API-Key': key, 'Content-Type': 'application/json'} if key else None
+    return {'API-Key': os.getenv('URLSCAN_DAEMON'), 'Content-Type': 'application/json'}
 
 
 def submit_scan(observable, headers):
-    data = {"url": observable, "visibility": "unlisted"}
     try:
-        resp = _safe_request('POST', 'https://urlscan.io/api/v1/scan/', headers=headers, json=data)
-    except (requests.RequestException, ValueError) as e:
-        return {"status": "error", "message": f"Submit error ❌ ({e})"}
+        resp = _safe_request('POST', 'https://urlscan.io/api/v1/scan/', headers=headers,
+                             json={"url": observable, "visibility": "unlisted"})
+    except (requests.RequestException, ValueError):
+        return {"status": "error", "message": "submit error ❌"}
     if resp.status_code == 200:
-        try:
-            body = resp.json()
-        except ValueError:
-            return {"status": "error", "message": "Invalid JSON on submit ❌"}
-        return {"status": "submitted", "api": body.get('api'),
-                "result": body.get('result'), "uuid": body.get('uuid')}
+        body = resp.json()
+        return {"status": "submitted", "api": body.get('api'), "result": body.get('result')}
     if resp.status_code == 400:
-        return {"status": "error", "message": "Skipped ⏭️ (blocked from scanning or invalid target)"}
-    if resp.status_code == 429:
-        return {"status": "error", "message": "Rate limit exceeded ❌"}
-    if resp.status_code in (401, 403):
-        return {"status": "error", "message": "Auth failed ❌ (check URLSCAN_DAEMON)"}
-    return {"status": "error", "message": f"Submit failed (HTTP {resp.status_code}) ❌"}
+        return {"status": "error", "message": "n/a (blocked from scanning or invalid target)"}
+    return {"status": "error", "message": f"submit failed (HTTP {resp.status_code}) ❌"}
 
 
 def poll_result(api_url, headers):
     if not api_url:
-        return None, "No result API URL returned ❌"
+        return None, "no result API URL ❌"
     deadline = time.time() + URLSCAN_MAX_WAIT
     while time.time() < deadline:
         try:
             resp = _safe_request('GET', api_url, headers=headers)
-        except (requests.RequestException, ValueError) as e:
-            return None, f"Network error ⚠️ ({e})"
+        except (requests.RequestException, ValueError):
+            return None, "network error ⚠️"
         if resp.status_code == 200:
-            try:
-                return resp.json(), None
-            except ValueError:
-                return None, "Invalid JSON in result ⚠️"
-        elif resp.status_code == 404:
+            return resp.json(), None
+        if resp.status_code == 404:          # not ready yet
             time.sleep(URLSCAN_POLL_INTERVAL)
             continue
-        elif resp.status_code == 410:
-            return None, "Result deleted (410) 🗑️"
-        elif resp.status_code == 429:
-            time.sleep(URLSCAN_POLL_INTERVAL * 2)
-            continue
-        else:
-            return None, f"Result HTTP {resp.status_code} ❌"
-    return None, "Timeout ⏳ (scan still processing)"
+        return None, f"result HTTP {resp.status_code} ❌"
+    return None, "timeout ⏳ (scan still processing)"
 
 
 def _gsb_malicious(res_data):
@@ -414,12 +346,10 @@ def get_screenshot_url(res_data):
 # --- AlienVault OTX -----------------------------------------------------------
 
 def _otx_headers():
-    key = os.getenv('ALIENVAULT_DAEMON')
-    return {'X-OTX-API-KEY': key, 'Accept': 'application/json'} if key else None
+    return {'X-OTX-API-KEY': os.getenv('ALIENVAULT_DAEMON'), 'Accept': 'application/json'}
 
 
 _OTX_CACHE = {}
-_OTX_LABS_AUTHORS = ('alienvault', 'levelblue')
 
 
 def _otx_link(itype, indicator):
@@ -428,220 +358,187 @@ def _otx_link(itype, indicator):
 
 
 def otx_lookup(observable, headers):
-    """Queries OTX 'general' and derives a verdict the way the OTX UI does:
-    LevelBlue Labs pulse membership or malware_families -> Malicious;
-    validation (whitelist) -> Clean; else by pulse count."""
-    if not headers:
-        return None
+    """Conservative OTX verdict: whitelisted -> Clean, pulses>=threshold ->
+    Suspicious, otherwise Clean. Pulse membership alone is never Malicious."""
     host = extract_host(observable)
     if not host:
-        return None
+        return {"verdict": "Unknown", "pulses": None, "whitelisted": False, "link": None}
     if _is_ip(host):
-        itype = 'IPv6' if ':' in host else 'IPv4'
-        indicator = host
+        itype, indicator = ('IPv6' if ':' in host else 'IPv4'), host
     else:
-        itype = 'domain'
-        indicator = registrable_domain(host) or host
+        itype, indicator = 'domain', (registrable_domain(host) or host)
 
-    cache_key = (itype, indicator)
-    if cache_key in _OTX_CACHE:
-        return _OTX_CACHE[cache_key]
+    key = (itype, indicator)
+    if key in _OTX_CACHE:
+        return _OTX_CACHE[key]
 
-    out = {"pulses": None, "whitelisted": False, "malware": [], "labs": False,
-           "verdict": "Unknown", "reason": "", "error": None,
-           "link": _otx_link(itype, indicator), "indicator": indicator, "itype": itype}
+    out = {"verdict": "Unknown", "pulses": None, "whitelisted": False,
+           "link": _otx_link(itype, indicator)}
     try:
         url = f"https://otx.alienvault.com/api/v1/indicators/{itype}/{quote(indicator)}/general"
         resp = _safe_request('GET', url, headers=headers)
         if resp.status_code == 200:
             data = resp.json()
-            pinfo = data.get('pulse_info') or {}
-            out["pulses"] = pinfo.get('count')
-            out["whitelisted"] = bool(data.get('validation'))
-            malware = set()
-            labs = False
-            for pulse in (pinfo.get('pulses') or []):
-                author = ((pulse.get('author') or {}).get('username')
-                          or pulse.get('author_name') or '')
-                if any(a in author.lower() for a in _OTX_LABS_AUTHORS):
-                    labs = True
-                for fam in (pulse.get('malware_families') or []):
-                    name = fam.get('display_name') or fam.get('id') if isinstance(fam, dict) else fam
-                    if name:
-                        malware.add(str(name))
-            out["malware"] = sorted(malware)
-            out["labs"] = labs
-
-            pulses = out["pulses"]
-            if labs:
-                out["verdict"], out["reason"] = "Malicious", "LevelBlue Labs pulse"
-            elif malware:
-                out["verdict"], out["reason"] = "Malicious", "malware: " + ", ".join(sorted(malware)[:3])
-            elif out["whitelisted"]:
-                out["verdict"], out["reason"] = "Clean", "whitelisted"
-            elif isinstance(pulses, int) and pulses >= OTX_SUSPICIOUS_PULSES:
-                out["verdict"], out["reason"] = "Suspicious", f"{pulses} pulses"
+            pulses = (data.get('pulse_info') or {}).get('count')
+            whitelisted = bool(data.get('validation'))
+            out["pulses"], out["whitelisted"] = pulses, whitelisted
+            if not whitelisted and isinstance(pulses, int) and pulses >= OTX_SUSPICIOUS_PULSES:
+                out["verdict"] = "Suspicious"
             else:
-                out["verdict"], out["reason"] = "Clean", f"{pulses or 0} pulses"
-        elif resp.status_code in (401, 403):
-            out["error"] = "auth failed (check ALIENVAULT_DAEMON)"
-        else:
-            out["error"] = f"HTTP {resp.status_code}"
-    except (requests.RequestException, ValueError) as e:
-        out["error"] = str(e)
-
-    _OTX_CACHE[cache_key] = out
+                out["verdict"] = "Clean"
+    except (requests.RequestException, ValueError):
+        pass
+    _OTX_CACHE[key] = out
     return out
+
 
 # --- VirusTotal ---------------------------------------------------------------
 
 def _vt_headers():
-    key = os.getenv('VIRUSTOTAL_DAEMON')
-    return {'x-apikey': key, 'Accept': 'application/json'} if key else None
+    return {'x-apikey': os.getenv('VIRUSTOTAL_DAEMON'), 'Accept': 'application/json'}
 
 
-def vt_lookup(observable, headers):
-    """Reads an existing VT report (never submits). Returns a dict or None."""
-    if not headers:
-        return None
+def _vt_object_endpoint(observable):
+    """Return (api_url, gui_url, kind) for a URL / IP / domain."""
     host = extract_host(observable)
-    is_url = observable.startswith(('http://', 'https://'))
-
-    if is_url:
+    if observable.startswith(('http://', 'https://')):
         url_id = base64.urlsafe_b64encode(observable.encode()).decode().strip('=')
-        api = f"https://www.virustotal.com/api/v3/urls/{url_id}"
-        gui = f"https://www.virustotal.com/gui/url/{url_id}"
-    elif _is_ip(host):
-        api = f"https://www.virustotal.com/api/v3/ip_addresses/{host}"
-        gui = f"https://www.virustotal.com/gui/ip-address/{host}"
-    else:
-        dom = registrable_domain(host) or host
-        api = f"https://www.virustotal.com/api/v3/domains/{dom}"
-        gui = f"https://www.virustotal.com/gui/domain/{dom}"
+        return (f"https://www.virustotal.com/api/v3/urls/{url_id}",
+                f"https://www.virustotal.com/gui/url/{url_id}", 'urls')
+    if _is_ip(host):
+        return (f"https://www.virustotal.com/api/v3/ip_addresses/{host}",
+                f"https://www.virustotal.com/gui/ip-address/{host}", 'ip_addresses')
+    dom = registrable_domain(host) or host
+    return (f"https://www.virustotal.com/api/v3/domains/{dom}",
+            f"https://www.virustotal.com/gui/domain/{dom}", 'domains')
 
+
+def _vt_verdict_from_stats(stats):
+    malicious = stats.get('malicious', 0)
+    suspicious = stats.get('suspicious', 0)
+    total = sum(v for v in stats.values() if isinstance(v, int))
+    if malicious > 0:
+        verdict = "Malicious"
+    elif suspicious > 0:
+        verdict = "Suspicious"
+    else:
+        verdict = "Clean"
+    return verdict, malicious, suspicious, total
+
+
+def vt_reanalyze(observable, headers):
+    """Ask VT to refresh the report and wait (bounded) for it to complete."""
+    api = _vt_object_endpoint(observable)[0]
+    try:
+        resp = _safe_request('POST', f"{api}/analyse", headers=headers)
+        analysis_id = ((resp.json() or {}).get('data') or {}).get('id')
+    except (requests.RequestException, ValueError):
+        return False
+    if not analysis_id:
+        return False
+    deadline = time.time() + VT_REANALYZE_MAX_WAIT
+    while time.time() < deadline:
+        try:
+            r = _safe_request('GET', f"https://www.virustotal.com/api/v3/analyses/{analysis_id}",
+                              headers=headers)
+            status = (((r.json() or {}).get('data') or {}).get('attributes') or {}).get('status')
+            if status == 'completed':
+                return True
+        except (requests.RequestException, ValueError):
+            return False
+        time.sleep(VT_REANALYZE_POLL)
+    return False
+
+
+def vt_lookup(observable, headers, reanalyze=False):
+    api, gui, kind = _vt_object_endpoint(observable)
+    reanalyzed = vt_reanalyze(observable, headers) if reanalyze else False
     out = {"verdict": "Unknown", "malicious": 0, "suspicious": 0, "total": 0,
-           "reputation": None, "gui": gui, "absent": False, "error": None}
+           "reputation": None, "gui": gui, "absent": False, "reanalyzed": reanalyzed}
     try:
         resp = _safe_request('GET', api, headers=headers)
         if resp.status_code == 200:
-            attrs = (resp.json().get('data') or {}).get('attributes') or {}
-            stats = attrs.get('last_analysis_stats') or {}
-            out["malicious"] = stats.get('malicious', 0)
-            out["suspicious"] = stats.get('suspicious', 0)
-            out["total"] = sum(v for v in stats.values() if isinstance(v, int))
-            out["reputation"] = attrs.get('reputation')
-            if is_url:
-                rid = (resp.json().get('data') or {}).get('id')
-                if rid:
-                    out["gui"] = f"https://www.virustotal.com/gui/url/{rid}"
-            if out["malicious"] > 0:
-                out["verdict"] = "Malicious"
-            elif out["suspicious"] > 0:
-                out["verdict"] = "Suspicious"
-            else:
-                out["verdict"] = "Clean"
+            data = resp.json().get('data') or {}
+            attrs = data.get('attributes') or {}
+            verdict, malicious, suspicious, total = _vt_verdict_from_stats(
+                attrs.get('last_analysis_stats') or {})
+            out.update(verdict=verdict, malicious=malicious, suspicious=suspicious,
+                       total=total, reputation=attrs.get('reputation'))
+            if kind == 'urls' and data.get('id'):
+                out["gui"] = f"https://www.virustotal.com/gui/url/{data['id']}"
         elif resp.status_code == 404:
-            out["absent"] = True
-            out["verdict"] = "No VT record"
-        elif resp.status_code == 429:
-            out["error"] = "rate limited"
-        elif resp.status_code in (401, 403):
-            out["error"] = "auth failed (check VIRUSTOTAL_DAEMON)"
-        else:
-            out["error"] = f"HTTP {resp.status_code}"
-    except (requests.RequestException, ValueError) as e:
-        out["error"] = str(e)
+            out["absent"], out["verdict"] = True, "No VT record"
+    except (requests.RequestException, ValueError):
+        pass
+    return out
+
+
+def vt_file_lookup(sha256, headers):
+    """Read-only VT report for a file hash. Never uploads."""
+    out = {"verdict": "Unknown", "malicious": 0, "suspicious": 0, "total": 0,
+           "gui": f"https://www.virustotal.com/gui/file/{sha256}", "absent": False}
+    try:
+        resp = _safe_request('GET', f"https://www.virustotal.com/api/v3/files/{sha256}",
+                             headers=headers)
+        if resp.status_code == 200:
+            attrs = (resp.json().get('data') or {}).get('attributes') or {}
+            verdict, malicious, suspicious, total = _vt_verdict_from_stats(
+                attrs.get('last_analysis_stats') or {})
+            out.update(verdict=verdict, malicious=malicious, suspicious=suspicious, total=total)
+        elif resp.status_code == 404:
+            out["absent"], out["verdict"] = True, "No VT record"
+    except (requests.RequestException, ValueError):
+        pass
     return out
 
 
 # --- AbuseIPDB ----------------------------------------------------------------
 
 def _abuseipdb_headers():
-    key = os.getenv('ABUSEIPDB_DAEMON')
-    return {'Key': key, 'Accept': 'application/json'} if key else None
+    return {'Key': os.getenv('ABUSEIPDB_DAEMON'), 'Accept': 'application/json'}
 
 
 def abuseipdb_check(ip, headers):
-    out = {"score": None, "reports": None, "country": None, "isp": None,
-           "whitelisted": False, "verdict": "Unknown", "error": None,
+    out = {"score": None, "reports": None, "country": None, "usage": None, "isp": None,
+           "whitelisted": False, "verdict": "Unknown",
            "link": f"https://www.abuseipdb.com/check/{ip}"}
     try:
         resp = _safe_request('GET', 'https://api.abuseipdb.com/api/v2/check', headers=headers,
                              params={'ipAddress': ip, 'maxAgeInDays': ABUSEIPDB_MAX_AGE_DAYS})
         if resp.status_code == 200:
             data = (resp.json() or {}).get('data') or {}
-            out["score"] = data.get('abuseConfidenceScore')
-            out["reports"] = data.get('totalReports')
-            out["country"] = data.get('countryCode')
-            out["isp"] = data.get('isp')
-            out["whitelisted"] = bool(data.get('isWhitelisted'))
+            out.update(score=data.get('abuseConfidenceScore'), reports=data.get('totalReports'),
+                       country=data.get('countryName'), usage=data.get('usageType'),
+                       isp=data.get('isp'), whitelisted=bool(data.get('isWhitelisted')))
             score = out["score"] or 0
-            if out["whitelisted"]:
-                out["verdict"] = "CLEAN ✅"
+            if out["whitelisted"] or score < ABUSE_SUSPICIOUS:
+                out["verdict"] = "Clean"
             elif score >= ABUSE_MALICIOUS:
-                out["verdict"] = "MALICIOUS ❌"
-            elif score >= ABUSE_SUSPICIOUS:
-                out["verdict"] = "SUSPICIOUS ⚠️"
+                out["verdict"] = "Malicious"
             else:
-                out["verdict"] = "CLEAN ✅"
-        elif resp.status_code in (401, 403):
-            out["error"] = "auth failed (check ABUSEIPDB_DAEMON)"
-        elif resp.status_code == 429:
-            out["error"] = "rate limited"
-        else:
-            out["error"] = f"HTTP {resp.status_code}"
-    except (requests.RequestException, ValueError) as e:
-        out["error"] = str(e)
+                out["verdict"] = "Suspicious"
+    except (requests.RequestException, ValueError):
+        pass
     return out
 
 
-# --- Verdict logic ------------------------------------------------------------
+# --- Per-source record builders -----------------------------------------------
 
-def compute_verdict(sig):
-    mal, susp = [], []
-    if sig.get('urlscan_malicious'):
-        mal.append("urlscan flagged malicious")
-    if sig.get('gsb_malicious'):
-        mal.append("Google Safe Browsing hit")
-    score = sig.get('score')
-    if isinstance(score, (int, float)):
-        if score >= SCORE_MALICIOUS:
-            mal.append(f"urlscan score {score}")
-        elif score >= SCORE_SUSPICIOUS:
-            susp.append(f"urlscan score {score}")
-    otx = sig.get('otx') or {}
-    if otx.get('verdict') == 'Malicious':
-        mal.append("OTX " + (otx.get('reason') or 'malicious'))
-    elif otx.get('verdict') == 'Suspicious':
-        susp.append("OTX " + (otx.get('reason') or 'suspicious'))
-    age = sig.get('age_days')
-    if isinstance(age, int) and age <= RECENT_DAYS:
-        susp.append(f"domain created {age}d ago")
-    if mal:
-        return "MALICIOUS ❌", mal + susp
-    if susp:
-        return "SUSPICIOUS ⚠️", susp
-    return "CLEAN ✅", []
-
-
-def build_record(observable, urlscan_outcome, otx_headers):
+def build_url_record(url, urlscan_outcome):
+    """Verdict for a URL comes from URLScan.io (+ its GSB processor)."""
     res_data = None
-    urlscan_field = "n/a"
-    result_url = None
-    gsb_field = None
-    score = None
+    urlscan_field, gsb_field, note, verdict = "n/a", None, None, "Unknown"
+    result_url = screenshot = None
+    flagged_by = []
 
-    if urlscan_outcome is not None:
-        if urlscan_outcome["status"] == "submitted":
-            result_url = urlscan_outcome.get("result")
-            res_data, status_text = poll_result(urlscan_outcome.get("api"), _urlscan_headers())
-            if res_data is None:
-                urlscan_field = status_text
-        else:
-            urlscan_field = urlscan_outcome["message"]
+    if urlscan_outcome and urlscan_outcome["status"] == "submitted":
+        result_url = urlscan_outcome.get("result")
+        res_data, status_text = poll_result(urlscan_outcome.get("api"), _urlscan_headers())
+        if res_data is None:
+            urlscan_field = note = status_text
+    elif urlscan_outcome:
+        urlscan_field = note = urlscan_outcome["message"]
 
-    us_malicious = gsb_malicious = False
-    screenshot = None
     if res_data is not None:
         verdicts = res_data.get('verdicts') or {}
         overall = verdicts.get('overall') or {}
@@ -649,61 +546,70 @@ def build_record(observable, urlscan_outcome, otx_headers):
         us_malicious = bool(overall.get('malicious') or urlscan_v.get('malicious'))
         score = overall.get('score', urlscan_v.get('score'))
         gsb_malicious = _gsb_malicious(res_data)
+        screenshot = get_screenshot_url(res_data)
         urlscan_field = "malicious" if us_malicious else "clean"
         gsb_field = "malicious" if gsb_malicious else "clean"
-        screenshot = get_screenshot_url(res_data)
 
-    apex = registrable_domain(extract_host(observable))
-    otx = otx_lookup(observable, otx_headers)
-    created_iso = creation_date_iso(res_data, apex)
-    age = _age_days(created_iso)
-
-    label, reasons = compute_verdict({
-        'urlscan_malicious': us_malicious, 'gsb_malicious': gsb_malicious,
-        'score': score, 'otx': otx, 'age_days': age,
-    })
-
-    return {
-        'observable': observable,
-        'is_url': observable.startswith(('http://', 'https://')),
-        'label': label, 'reasons': reasons,
-        'urlscan_field': urlscan_field, 'gsb_field': gsb_field, 'score': score,
-        'otx': otx, 'created': _iso_to_ddmmyyyy(created_iso),
-        'result_url': result_url, 'screenshot': screenshot,
-    }
-
-
-def format_line(rec):
-    fields = [f"URLScan: {rec['urlscan_field']}"]
-    if rec['gsb_field'] is not None:
-        fields.append(f"GSB: {rec['gsb_field']}")
-
-    otx = rec['otx']
-    if otx is not None:
-        if otx.get('error'):
-            fields.append(f"OTX: lookup error ({otx['error']})")
+        if us_malicious or gsb_malicious or (isinstance(score, (int, float)) and score >= SCORE_MALICIOUS):
+            verdict = "Malicious"
+        elif isinstance(score, (int, float)) and score >= SCORE_SUSPICIOUS:
+            verdict = "Suspicious"
         else:
-            pulses = otx.get('pulses')
-            otx_txt = f"OTX: {otx.get('verdict', 'Unknown')} ({pulses if pulses is not None else 0} pulses)"
-            if otx.get('malware'):
-                otx_txt += " malware: " + ", ".join(otx['malware'][:3])
-            fields.append(otx_txt)
+            verdict = "Clean"
 
-    if isinstance(rec['score'], (int, float)):
-        fields.append(f"Score: {rec['score']}")
-    fields.append(f"Created: {rec['created']}")
+        if us_malicious or (isinstance(score, (int, float)) and score >= SCORE_SUSPICIOUS):
+            flagged_by.append(SRC_URLSCAN)
+        if gsb_malicious:
+            flagged_by.append(SRC_GSB)
 
-    if rec['result_url']:
+    return {'observable': url, 'verdict': verdict, 'urlscan_field': urlscan_field,
+            'gsb_field': gsb_field, 'result_url': result_url, 'screenshot': screenshot,
+            'note': note, 'flagged_by': flagged_by, 'cleared_by': []}
+
+
+def build_whitelisted_url_record(url, parent_domain):
+    """URL skipped because its registrable domain is whitelisted in AlienVault OTX."""
+    return {'observable': url, 'verdict': "WhitelistSkip",
+            'urlscan_field': "Skipped (parent domain whitelisted in AlienVault OTX)",
+            'gsb_field': None, 'result_url': None, 'screenshot': None,
+            'note': f"parent domain {parent_domain} whitelisted in AlienVault OTX",
+            'flagged_by': [], 'cleared_by': []}
+
+
+def build_domain_record(domain, otx_headers):
+    """Verdict for a domain comes from AlienVault OTX. Creation date (RDAP) is
+    context only."""
+    otx = otx_lookup(domain, otx_headers)
+    verdict = otx['verdict']
+    flagged_by = [SRC_OTX] if verdict in ("Suspicious", "Malicious") else []
+    created_iso = None if _is_ip(domain) else rdap_creation_date(domain)
+    return {'observable': domain, 'verdict': verdict, 'otx': otx,
+            'created': _iso_to_ddmmyyyy(created_iso),
+            'note': "inconclusive" if verdict == "Unknown" else None,
+            'whitelisted': bool(otx.get('whitelisted')),
+            'flagged_by': flagged_by, 'cleared_by': []}
+
+
+def format_url_line(rec):
+    fields = [f"URLScan: {rec['urlscan_field']}"]
+    if rec.get('gsb_field') is not None:
+        fields.append(f"GSB: {rec['gsb_field']}")
+    if rec.get('result_url'):
         fields.append(f"[Report]({rec['result_url']})")
-    if rec['screenshot']:
+    if rec.get('screenshot'):
         fields.append(f"[Screenshot]({rec['screenshot']})")
-    if otx is not None and otx.get('link'):
-        fields.append(f"[OTX]({otx['link']})")
+    return f"* *{defang(rec['observable'])}*: **{verdict_label(rec['verdict'])}** | " + " | ".join(fields)
 
-    line = f"* *{defang(rec['observable'])}*: **{rec['label']}** | " + " | ".join(fields)
-    if rec['label'] != "CLEAN ✅" and rec['reasons']:
-        line += f" | _{'; '.join(rec['reasons'])}_"
-    return line
+
+def format_domain_line(rec):
+    otx = rec['otx']
+    wl = "**Whitelisted 🏳️** | " if otx.get('whitelisted') else ""
+    pulses = otx.get('pulses')
+    otx_txt = f"{wl}OTX: {otx.get('verdict', 'Unknown')} ({pulses if pulses is not None else 0} pulses)"
+    fields = [otx_txt, f"Created: {rec['created']}"]
+    if otx.get('link'):
+        fields.append(f"[AlienVault OTX]({otx['link']})")
+    return f"* *{defang(rec['observable'])}*: **{verdict_label(rec['verdict'])}** | " + " | ".join(fields)
 
 
 # --- IP extraction ------------------------------------------------------------
@@ -726,14 +632,12 @@ def _public_ip(token):
 def find_sender_ip(headers):
     auth = headers.get('Authentication-Results', '') or ''
     m = re.search(r'client-ip=([0-9A-Fa-f:.]+)', auth) or re.search(r'sender IP is ([0-9.]+)', auth)
-    if m:
-        return _public_ip(m.group(1))
-    return None
+    return _public_ip(m.group(1)) if m else None
 
 
 def collect_ips(headers):
-    """Public IPs from Received / Authentication-Results / X-*-IP headers.
-    Returns an ordered list with the SPF sender IP first when identifiable."""
+    """Public IPs from Received / Authentication-Results / X-*-IP headers, SPF
+    sender first."""
     text_parts = []
     for name in ('Received', 'Authentication-Results', 'X-Originating-IP',
                  'X-Sender-IP', 'X-SenderIP', 'X-Source-IP'):
@@ -751,6 +655,40 @@ def collect_ips(headers):
             seen.add(ip)
             ordered.append(ip)
     return ordered, sender
+
+
+# --- Attachments --------------------------------------------------------------
+
+def hash_attachments(raw_bytes):
+    """SHA-256 / MD5 of MIME parts already inside the message (nothing is
+    downloaded). Parses from *bytes* so binary parts aren't corrupted through a
+    text codec. Inline images (referenced by Content-ID) are hashed too."""
+    try:
+        msg = email.message_from_bytes(raw_bytes)
+    except Exception:
+        return []
+    out = []
+    for part in msg.walk():
+        if part.is_multipart():
+            continue
+        filename = part.get_filename()
+        disp = part.get_content_disposition() or ''
+        # Skip the plain-text / HTML body; hash everything else carrying bytes.
+        if part.get_content_maintype() == 'text' and not filename and disp != 'attachment':
+            continue
+        try:
+            payload = part.get_payload(decode=True)
+        except Exception:
+            payload = None
+        if not payload:
+            continue
+        cid = part.get('Content-ID')
+        name = decode_mime_words(filename) if filename else \
+            (f"(inline {cid.strip('<>')})" if cid else "(unnamed)")
+        out.append({'filename': name, 'content_type': part.get_content_type(),
+                    'size': len(payload), 'sha256': hashlib.sha256(payload).hexdigest(),
+                    'md5': hashlib.md5(payload).hexdigest()})
+    return out
 
 
 # --- Orchestration ------------------------------------------------------------
@@ -775,168 +713,212 @@ def collect_observables(raw_header_text, headers):
         host = extract_host(clean_url)
         if host:
             hosts.add(host)
-    observables = {u for u in urls if is_scannable(u)}
-    for host in hosts:
-        apex = registrable_domain(host)
-        if apex and is_scannable(apex):
-            observables.add(apex)
-    return sorted(observables)
+    url_obs = sorted(u for u in urls if is_scannable(u))
+    domain_obs = {apex for host in hosts
+                  if (apex := registrable_domain(host)) and is_scannable(apex)}
+    return url_obs, sorted(domain_obs)
 
 
-def run_osint(raw_header_text, headers, observables):
+def _review_reason(rec):
+    """Build the 'Further Reviews' reason straight from the OSINT signals."""
+    if rec['verdict'] == 'Unknown':
+        return rec.get('note') or 'inconclusive'
+    parts = []
+    if rec.get('flagged_by'):
+        parts.append("Flagged by " + _join(rec['flagged_by']))
+    if rec.get('cleared_by'):
+        parts.append("cleared by " + _join(rec['cleared_by']))
+    return ", ".join(parts) if parts else 'inconclusive'
+
+
+def run_osint(raw_header_text, headers, url_obs, domain_obs, raw_bytes):
     us_headers = _urlscan_headers()
     otx_headers = _otx_headers()
     vt_headers = _vt_headers()
     abuse_headers = _abuseipdb_headers()
-
-    notes = []
-    if not us_headers:
-        notes.append("URLSCAN_DAEMON not set — urlscan skipped")
-    if not otx_headers:
-        notes.append("ALIENVAULT_DAEMON not set — OTX skipped")
-    if not vt_headers:
-        notes.append("VIRUSTOTAL_DAEMON not set — VT deep-dive skipped")
-    if not abuse_headers:
-        notes.append("ABUSEIPDB_DAEMON not set — IP reputation skipped")
-    for n in notes:
-        print(f"* *Note:* {n}. ⚠️")
     print()
 
-    # URLScan submissions up-front so scans run in parallel.
-    pending = {}
-    if us_headers:
-        for obs in observables:
-            pending[obs] = submit_scan(obs, us_headers)
-            time.sleep(URLSCAN_SUBMIT_THROTTLE)
+    # --- Domains: AlienVault OTX is the sole verdict source ---
+    domain_records = [build_domain_record(d, otx_headers) for d in domain_obs]
+    whitelisted_apexes = {r['observable'] for r in domain_records if r.get('whitelisted')}
 
-    records = [build_record(obs, pending.get(obs), otx_headers) for obs in observables]
-    url_records = sorted([r for r in records if r['is_url']], key=lambda r: r['observable'].lower())
-    domain_records = sorted([r for r in records if not r['is_url']], key=lambda r: r['observable'].lower())
-
-    print("### URLs")
-    if url_records:
-        for rec in url_records:
-            print(format_line(rec))
-    else:
-        print("*No URLs found.*")
-
-    print("\n### Domains")
+    print("### Domains")
+    print("---")
     if domain_records:
-        for rec in domain_records:
-            print(format_line(rec))
+        for r in domain_records:
+            print(format_domain_line(r))
     else:
         print("*No domains found.*")
 
-    # IPs via AbuseIPDB
-    print("\n### IPs")
+    # --- URLs: URLScan.io is the sole verdict source ---
+    pending = {}
+    for u in url_obs:
+        if registrable_domain(extract_host(u)) in whitelisted_apexes:
+            continue
+        pending[u] = submit_scan(u, us_headers)
+        time.sleep(URLSCAN_SUBMIT_THROTTLE)
+
+    url_records = []
+    for u in url_obs:
+        apex = registrable_domain(extract_host(u))
+        if apex in whitelisted_apexes:
+            url_records.append(build_whitelisted_url_record(u, apex))
+        else:
+            url_records.append(build_url_record(u, pending.get(u)))
+
+    print("---")
+    print("### URLs")
+    print("---")
+    if url_records:
+        for r in url_records:
+            print(format_url_line(r))
+    else:
+        print("*No URLs found.*")
+
+    # --- IPs: AbuseIPDB is the sole verdict source ---
+    print("---")
+    print("### IPs")
+    print("---")
     ips, sender = collect_ips(headers)
     ips = ips[:ABUSEIPDB_MAX_IPS]
+    ip_followups = []
     if not ips:
         print("*No public IPs found in headers.*")
-    elif not abuse_headers:
-        print("*ABUSEIPDB_DAEMON not set — skipping IP reputation. The following "
-              "public IPs were seen:* " + ", ".join(defang(ip) for ip in ips))
-    else:
-        for ip in ips:
-            ab = abuseipdb_check(ip, abuse_headers)
-            tag = " _(SPF sender)_" if ip == sender else ""
-            if ab["error"]:
-                print(f"* *{defang(ip)}*{tag}: AbuseIPDB lookup error ({ab['error']})")
-                continue
-            extra = []
-            extra.append(f"AbuseIPDB: {ab['score']}/100")
-            if ab["reports"] is not None:
-                extra.append(f"reports: {ab['reports']}")
-            if ab["country"]:
-                extra.append(f"CC: {ab['country']}")
-            if ab["isp"]:
-                extra.append(f"ISP: {ab['isp']}")
-            if ab["whitelisted"]:
-                extra.append("whitelisted")
-            extra.append(f"[AbuseIPDB]({ab['link']})")
-            print(f"* *{defang(ip)}*{tag}: **{ab['verdict']}** | " + " | ".join(extra))
+    for ip in ips:
+        ab = abuseipdb_check(ip, abuse_headers)
+        tag = " _(SPF sender)_" if ip == sender else ""
+        extra = [f"AbuseIPDB: {ab['score']}/100"]
+        if ab["reports"] is not None:
+            extra.append(f"Reports: {ab['reports']}")
+        if ab["country"]:
+            extra.append(f"Country: {ab['country']}")
+        if ab["usage"]:
+            extra.append(f"Usage Type: {ab['usage']}")
+        if ab["isp"]:
+            extra.append(f"ISP: {ab['isp']}")
+        if ab["whitelisted"]:
+            extra.append("Whitelisted")
+        extra.append(f"[AbuseIPDB]({ab['link']})")
+        print(f"* *{defang(ip)}*{tag}: **{verdict_label(ab['verdict'])}** | " + " | ".join(extra))
+        if ab["verdict"] in ("Suspicious", "Malicious"):
+            ip_followups.append((ip, f"{verdict_label(ab['verdict'])} — Flagged by {SRC_ABUSE}"))
 
-    # VirusTotal deep-dive on flagged URLs/domains
-    print("\n### Interesting URLs & Domains")
-    standouts = [r for r in records if r['label'] != "CLEAN ✅"]
-    standouts.sort(key=lambda r: 0 if r['label'].startswith("MALICIOUS") else 1)
-    if not standouts:
-        print(f"*Nothing stood out — all {len(records)} URLs/domains look clean.*")
-    elif not vt_headers:
-        print(f"*{len(standouts)} item(s) flagged for review (VIRUSTOTAL_DAEMON not set):*")
-        for r in standouts:
-            print(f"* *{defang(r['observable'])}* — **{r['label']}**: {'; '.join(r['reasons'])}")
+    # --- VirusTotal deep-dive: top-3 flagged URLs/domains only ---
+    print("---")
+    print("### VirusTotal")
+    interesting = [r for r in (url_records + domain_records)
+                   if r['verdict'] in ('Malicious', 'Suspicious')]
+    interesting.sort(key=lambda r: 0 if r['verdict'] == 'Malicious' else 1)
+    top_n, vt_overflow = interesting[:VT_MAX_LOOKUPS], interesting[VT_MAX_LOOKUPS:]
+
+    if not interesting:
+        print("*Nothing flagged — All URLs/domains came back clean.*")
     else:
-        todo = standouts[:VT_MAX_LOOKUPS]
-        overflow = standouts[VT_MAX_LOOKUPS:]
-        print(f"*VirusTotal deep-dive on {len(todo)} flagged item(s) "
-              f"(max 4/min, prioritised by severity):*\n")
-        for i, rec in enumerate(todo):
+        for i, rec in enumerate(top_n):
             if i:
                 time.sleep(VT_THROTTLE)
-            vt = vt_lookup(rec['observable'], vt_headers)
+            vt = vt_lookup(rec['observable'], vt_headers, reanalyze=VT_REANALYZE)
             parts = [f"VT: {vt['verdict']}"]
-            if not vt.get('absent') and not vt.get('error'):
+            if not vt.get('absent'):
                 parts.append(f"{vt['malicious']}/{vt['total']} malicious")
                 if vt.get('suspicious'):
                     parts.append(f"{vt['suspicious']} suspicious")
                 if vt.get('reputation') is not None:
                     parts.append(f"reputation {vt['reputation']}")
-            if vt.get('error'):
-                parts = [f"VT: lookup error ({vt['error']})"]
+            if vt.get('reanalyzed'):
+                parts.append("reanalyzed ♻️ ")
+
+            # VT either corroborates the flag or clears it (downgrade to review).
+            if vt['verdict'] in ('Malicious', 'Suspicious'):
+                rec['flagged_by'].append(SRC_VT)
+            elif rec['verdict'] == 'Suspicious' and not vt.get('absent') and vt['verdict'] == 'Clean':
+                rec['verdict'] = 'NeedsReview'
+                rec['cleared_by'].append(SRC_VT)
+
             parts.append(f"[VirusTotal]({vt['gui']})")
-            print(f"* *{defang(rec['observable'])}* — **{rec['label']}** | "
-                  + " | ".join(parts) + f" | _{'; '.join(rec['reasons'])}_")
-        for rec in overflow:
-            print(f"* *{defang(rec['observable'])}* — **{rec['label']}** "
-                  f"(VT skipped, over 4/min cap): _{'; '.join(rec['reasons'])}_")
+            print(f"* *{defang(rec['observable'])}* — **{verdict_label(rec['verdict'])}** | "
+                  + " | ".join(parts))
+
+        for rec in vt_overflow:
+            print(f"* *{defang(rec['observable'])}* — **{verdict_label(rec['verdict'])}** "
+                  f"(beyond top {VT_MAX_LOOKUPS}; check VirusTotal manually)")
+
+    # --- Attachments (hashed locally, no download) ---
+    print("---")
+    print("### Attachments")
+    print("---")
+    atts = hash_attachments(raw_bytes)
+    if not atts:
+        print("*No file attachments found. (Remote images referenced by the email "
+              "are listed under URLs, not here.)*")
+    for a in atts:
+        line = (f"* *{defang(a['filename'])}* ({a['content_type']}, {a['size']} bytes) | "
+                f"SHA-256: `{a['sha256']}`")
+        vf = vt_file_lookup(a['sha256'], vt_headers)
+        if vf.get('absent'):
+            line += " | VT: No VT record"
+        else:
+            line += f" | VT: {vf['verdict']} ({vf['malicious']}/{vf['total']} malicious)"
+        line += f" | [VirusTotal]({vf['gui']})"
+        print(line)
+
+    # --- Consolidated review list (verdict + dynamically-sourced flags) ---
+    print("---")
+    print("### Further Reviews")
+    print("---")
+    manual = [(r['observable'], f"{verdict_label(r['verdict'])} — {_review_reason(r)}")
+              for r in (url_records + domain_records)
+              if r['verdict'] in ('Unknown', 'Suspicious', 'NeedsReview', 'Malicious')]
+    manual.extend(ip_followups)
+
+    if manual:
+        seen = set()
+        for obs, reason in manual:
+            if obs in seen:
+                continue
+            seen.add(obs)
+            print(f"* *{defang(obs)}* — {reason}")
+    else:
+        print("*Nothing requires further review.*")
 
 
-def analyze_headers(raw_header_text):
+def analyze_headers(raw_header_text, raw_bytes=None):
+    if raw_bytes is None:
+        raw_bytes = raw_header_text.encode('utf-8', 'surrogateescape')
     headers = HeaderParser().parsestr(raw_header_text)
 
     print("# Headers Analysis")
     print("---")
-
-    from_addr = defang(decode_mime_words(headers.get('From')))
-    to_addr = defang(decode_mime_words(headers.get('To')))
-    reply_to = defang(decode_mime_words(headers.get('Reply-To', 'Not Found')))
-    return_path = defang(decode_mime_words(headers.get('Return-Path', 'Not Found')))
-    subject = defang(decode_mime_words(headers.get('Subject')))
-    utc_date = convert_to_utc(headers.get('Date', 'Not Found'))
-    msg_id = " ".join(headers.get('Message-ID', 'Not Found').split())
-    auth_flat = " ".join(headers.get('Authentication-Results', 'Not Found').split())
-    auth_results_formatted = parse_auth_results(auth_flat)
-
     print("## Message Metadata")
-    print(f"* **From:** {from_addr}")
-    print(f"* **To:** {to_addr}")
-    print(f"* **Subject:** {subject}")
-    print(f"* **Date:** {utc_date}")
-    print(f"* **Reply-To:** {reply_to}")
-    print(f"* **Return-Path:** {return_path}")
-    print(f"* **Message-ID:** {msg_id}")
+    print(f"* **From:** {defang(decode_mime_words(headers.get('From')))}")
+    print(f"* **To:** {defang(decode_mime_words(headers.get('To')))}")
+    print(f"* **Subject:** {defang(decode_mime_words(headers.get('Subject')))}")
+    print(f"* **Date:** {convert_to_utc(headers.get('Date', 'Not Found'))}")
+    print(f"* **Reply-To:** {defang(decode_mime_words(headers.get('Reply-To', 'Not Found')))}")
+    print(f"* **Return-Path:** {defang(decode_mime_words(headers.get('Return-Path', 'Not Found')))}")
+    print(f"* **Message-ID:** {' '.join(headers.get('Message-ID', 'Not Found').split())}")
     print("---")
     print("## Authentication Results")
     print("---")
     print("```")
-    print(auth_results_formatted)
+    print(parse_auth_results(" ".join(headers.get('Authentication-Results', 'Not Found').split())))
     print("```")
     print("---")
 
-    observables = collect_observables(raw_header_text, headers)
+    url_obs, domain_obs = collect_observables(raw_header_text, headers)
     print("## OSINT Lookups")
-    print("*(Passive lookups only — urlscan/RDAP/OTX/VirusTotal/AbuseIPDB APIs; "
-          "no target is visited directly. Waiting for all scans, sorted alphabetically...)*")
     print("---")
-    run_osint(raw_header_text, headers, observables)
+    run_osint(raw_header_text, headers, url_obs, domain_obs, raw_bytes)
 
 
 if __name__ == "__main__":
-    print("Paste the raw email headers below.")
+    print("Paste the raw email below.")
+    print("Tip: paste the FULL message (headers + body) so attachments can be hashed; "
+          "headers-only also works for everything except attachment hashing.")
     print("When finished, press Enter to go to a new line, then press Ctrl+D to run the analysis:\n")
-    raw_input_text = sys.stdin.read()
+    raw_bytes = sys.stdin.buffer.read()
+    raw_input_text = raw_bytes.decode('utf-8', errors='surrogateescape')
     if raw_input_text.strip():
-        analyze_headers(raw_input_text)
+        analyze_headers(raw_input_text, raw_bytes)
     else:
         print("\nNo headers provided. Exiting daemon.")
