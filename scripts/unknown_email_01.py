@@ -11,6 +11,7 @@ import hashlib
 import ipaddress
 import requests
 import tldextract
+import urllib3
 from urllib.parse import urlparse, quote
 from email.parser import HeaderParser
 from email.header import decode_header
@@ -19,6 +20,8 @@ from datetime import timezone, date
 from dotenv import load_dotenv
 
 load_dotenv()
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # --- Config -------------------------------------------------------------------
 
@@ -297,7 +300,7 @@ def rdap_creation_date(apex_domain):
     result = None
     try:
         resp = _safe_request('GET', f'https://rdap.org/domain/{quote(apex_domain)}',
-                             headers={'Accept': 'application/rdap+json'}, allow_redirects=True)
+                             headers={'Accept': 'application/rdap+json'}, allow_redirects=True, verify = False)
         if resp.status_code == 200:
             result = _search_creation_date(resp.json())
     except (requests.RequestException, ValueError):
@@ -315,7 +318,7 @@ def _urlscan_headers():
 def submit_scan(observable, headers):
     try:
         resp = _safe_request('POST', 'https://urlscan.io/api/v1/scan/', headers=headers,
-                             json={"url": observable, "visibility": "unlisted"})
+                             json={"url": observable, "visibility": "unlisted"}, verify = False)
     except (requests.RequestException, ValueError):
         return {"status": "error", "message": "submit error ❌"}
     if resp.status_code == 200:
@@ -332,7 +335,7 @@ def poll_result(api_url, headers):
     deadline = time.time() + URLSCAN_MAX_WAIT
     while time.time() < deadline:
         try:
-            resp = _safe_request('GET', api_url, headers=headers)
+            resp = _safe_request('GET', api_url, headers=headers, verify = False)
         except (requests.RequestException, ValueError):
             return None, "network error ⚠️"
         if resp.status_code == 200:
@@ -395,7 +398,7 @@ def otx_lookup(observable, headers):
            "link": _otx_link(itype, indicator)}
     try:
         url = f"https://otx.alienvault.com/api/v1/indicators/{itype}/{quote(indicator)}/general"
-        resp = _safe_request('GET', url, headers=headers)
+        resp = _safe_request('GET', url, headers=headers, verify = False)
         if resp.status_code == 200:
             data = resp.json()
             pulses = (data.get('pulse_info') or {}).get('count')
@@ -452,7 +455,7 @@ def _poll_vt_analysis(analysis_id, headers, max_wait, poll):
         try:
             r = _safe_request(
                 'GET', f"https://www.virustotal.com/api/v3/analyses/{analysis_id}",
-                headers=headers)
+                headers=headers, verify = False)
             status = (((r.json() or {}).get('data') or {}).get('attributes') or {}).get('status')
             if status == 'completed':
                 return True
@@ -466,7 +469,7 @@ def vt_reanalyze(observable, headers):
     """Ask VT to refresh an existing report and wait (bounded) for it to complete."""
     api = _vt_object_endpoint(observable)[0]
     try:
-        resp = _safe_request('POST', f"{api}/analyse", headers=headers)
+        resp = _safe_request('POST', f"{api}/analyse", headers=headers, verify = False)
         analysis_id = ((resp.json() or {}).get('data') or {}).get('id')
     except (requests.RequestException, ValueError):
         return False
@@ -483,7 +486,7 @@ def vt_submit_url(url, headers):
     try:
         sub_headers = {**headers, 'Content-Type': 'application/x-www-form-urlencoded'}
         resp = _safe_request('POST', 'https://www.virustotal.com/api/v3/urls',
-                             headers=sub_headers, data={'url': url})
+                             headers=sub_headers, data={'url': url}, verify = False)
         if resp.status_code not in (200, 201):
             return False
         analysis_id = ((resp.json() or {}).get('data') or {}).get('id')
@@ -502,13 +505,13 @@ def vt_lookup(observable, headers, reanalyze=False, allow_submit=False):
            "reputation": None, "gui": gui, "absent": False,
            "reanalyzed": reanalyzed, "submitted": False}
     try:
-        resp = _safe_request('GET', api, headers=headers)
+        resp = _safe_request('GET', api, headers=headers, verify = False)
         # URL VT has never seen → submit it (same as searching it on the site),
         # wait for the analysis to finish, then re-fetch.
         if resp.status_code == 404 and kind == 'urls' and allow_submit:
             if vt_submit_url(observable, headers):
                 out["submitted"] = True
-                resp = _safe_request('GET', api, headers=headers)
+                resp = _safe_request('GET', api, headers=headers, verify = False)
         if resp.status_code == 200:
             data = resp.json().get('data') or {}
             attrs = data.get('attributes') or {}
@@ -531,7 +534,7 @@ def vt_file_lookup(sha256, headers):
            "gui": f"https://www.virustotal.com/gui/file/{sha256}", "absent": False}
     try:
         resp = _safe_request('GET', f"https://www.virustotal.com/api/v3/files/{sha256}",
-                             headers=headers)
+                             headers=headers, verify = False)
         if resp.status_code == 200:
             attrs = (resp.json().get('data') or {}).get('attributes') or {}
             verdict, malicious, suspicious, total = _vt_verdict_from_stats(
@@ -556,7 +559,7 @@ def abuseipdb_check(ip, headers):
            "link": f"https://www.abuseipdb.com/check/{ip}"}
     try:
         resp = _safe_request('GET', 'https://api.abuseipdb.com/api/v2/check', headers=headers,
-                             params={'ipAddress': ip, 'maxAgeInDays': ABUSEIPDB_MAX_AGE_DAYS})
+                             params={'ipAddress': ip, 'maxAgeInDays': ABUSEIPDB_MAX_AGE_DAYS}, verify = False)
         if resp.status_code == 200:
             data = (resp.json() or {}).get('data') or {}
             out.update(score=data.get('abuseConfidenceScore'), reports=data.get('totalReports'),
