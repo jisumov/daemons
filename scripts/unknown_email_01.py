@@ -12,7 +12,7 @@ import ipaddress
 import requests
 import tldextract
 import urllib3
-from urllib.parse import urlparse, quote
+from urllib.parse import urlparse, quote, parse_qs
 from email.parser import HeaderParser
 from email.header import decode_header
 from email.utils import parsedate_to_datetime, parseaddr
@@ -30,7 +30,7 @@ _TLD_EXTRACT = tldextract.TLDExtract(suffix_list_urls=())
 URLSCAN_SUBMIT_THROTTLE = 2
 URLSCAN_POLL_INTERVAL = 4
 URLSCAN_MAX_WAIT = 60
-HTTP_TIMEOUT = 30
+HTTP_TIMEOUT = 20
 
 VT_THROTTLE = 15
 VT_MAX_LOOKUPS = 12
@@ -195,6 +195,29 @@ def extract_host(observable):
     return host.lower() if host else None
 
 
+def unwrap_safelink(url):
+    """Outlook SafeLinks hide the real destination inside the urlencoded `url=`
+    query parameter of a *.safelinks.protection.outlook.com redirector. Because
+    outlook.com is whitelisted in OTX, the wrapper would be skipped and the real
+    target never scanned. Return that decoded target so it can be scanned (and
+    its domain reach OTX) instead, or None if `url` isn't a SafeLink.
+
+    parse_qs already URL-decodes the value once, which is the correct (single)
+    level of decoding for a standard SafeLink — no second unquote needed."""
+    try:
+        parts = urlparse(url)
+    except ValueError:
+        return None
+    host = (parts.hostname or '').lower()
+    if not host.endswith('safelinks.protection.outlook.com'):
+        return None
+    target = (parse_qs(parts.query).get('url') or [None])[0]
+    if not target:
+        return None
+    target = target.strip().rstrip('.,;:!?)]([\'"<>')
+    return target if target.lower().startswith(('http://', 'https://')) else None
+
+
 def _is_private_ip(host):
     try:
         ip = ipaddress.ip_address(host)
@@ -340,7 +363,7 @@ def poll_result(api_url, headers):
             return None, "network error ⚠️"
         if resp.status_code == 200:
             return resp.json(), None
-        if resp.status_code == 404:          # not ready yet
+        if resp.status_code == 404:
             time.sleep(URLSCAN_POLL_INTERVAL)
             continue
         return None, f"result HTTP {resp.status_code} ❌"
@@ -826,6 +849,9 @@ def collect_observables(raw_header_text, headers):
             hosts.add(dom)
     for u in re.findall(r'(?i)\bhttps?://[^\s<>"\'{}|\\^`]+', decoded):
         clean_url = u.rstrip('.,;:!?)]([\'"<>')
+        target = unwrap_safelink(clean_url)
+        if target:
+            clean_url = target
         urls.add(clean_url)
         host = extract_host(clean_url)
         if host:
@@ -978,6 +1004,45 @@ def _attachment_manual_entry(att):
                 'reason': (f"Flagged by {SRC_VT} "
                            f"({vt.get('malicious', 0)}/{vt.get('total', 0)} malicious)")}
     return None
+
+
+# --- Defender XDR template ----------------------------------------------------
+
+# Only <DEFANGED_SENDER> and <DEFANGED_RECIPIENT> get auto-filled; every other
+# placeholder (counts, subjects, screenshots, users, the optional [ ... ] click
+# block) is left exactly as written for the analyst to complete by hand.
+DEFENDER_XDR_TEMPLATE = """# Defender XDR
+---
+* The sender <DEFANGED_SENDER> delivered <NUMBER> email(s) in the last month. [The subject(s) included "<SUBJECT_1>", "<SUBJECT_2>", among others.]
+---
+* {No|NUMBER} URL click(s) {was|were} found over the last month.
+  <SCREENSHOT_EXPLORER>
+  <SCREENSHOT_HUNTING>
+---
+[ 
+* The URL click(s) {was|were} performed by:
+  * <USER_1>
+  * <USER_2>
+---
+* The following are the targeted URL(s):
+  * <DEFANGED_URL> - **Clicked by <USER>**
+]
+* The user <DEFANGED_RECIPIENT> (<BUNIT>) has received <NUMBER> email(s) from <DEFANGED_SENDER> during the last month.
+  <SCREENSHOT_EXPLORER>
+---
+* There was [not] interaction with <DEFANGED_SENDER> for the last month.
+  <SCREENSHOT_EXPLORER>"""
+
+
+def build_defender_xdr_block(headers):
+    """Fill ONLY the sender/recipient placeholders from the parsed headers,
+    leaving the rest of the template untouched. Uses str.replace (not .format)
+    so the literal {No|NUMBER} / {was|were} braces survive verbatim."""
+    sender = defang(parseaddr(headers.get('From', ''))[1]) or "<DEFANGED_SENDER>"
+    recipient = defang(parseaddr(headers.get('To', ''))[1]) or "<DEFANGED_RECIPIENT>"
+    return (DEFENDER_XDR_TEMPLATE
+            .replace('<DEFANGED_SENDER>', sender)
+            .replace('<DEFANGED_RECIPIENT>', recipient))
 
 
 # --- The main pipeline --------------------------------------------------------
@@ -1162,6 +1227,10 @@ def analyze_headers(raw_header_text, raw_bytes=None):
     print("## OSINT Lookups")
     print("---")
     run_osint(raw_header_text, headers, url_obs, domain_obs, raw_bytes)
+
+    print()
+    print()
+    print(build_defender_xdr_block(headers))
 
 
 if __name__ == "__main__":
