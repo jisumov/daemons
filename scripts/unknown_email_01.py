@@ -12,7 +12,7 @@ import ipaddress
 import requests
 import tldextract
 import urllib3
-from urllib.parse import urlparse, quote, parse_qs
+from urllib.parse import urlparse, urlunparse, quote, parse_qs
 from email.parser import HeaderParser
 from email.header import decode_header
 from email.utils import parsedate_to_datetime, parseaddr
@@ -29,7 +29,7 @@ _TLD_EXTRACT = tldextract.TLDExtract(suffix_list_urls=())
 
 URLSCAN_SUBMIT_THROTTLE = 2
 URLSCAN_POLL_INTERVAL = 4
-URLSCAN_MAX_WAIT = 60
+URLSCAN_MAX_WAIT = 120
 HTTP_TIMEOUT = 20
 
 VT_THROTTLE = 15
@@ -39,6 +39,7 @@ VT_REANALYZE_POLL = 4
 VT_REANALYZE_MAX_WAIT = 45
 VT_URL_SUBMIT_POLL = 4
 VT_URL_SUBMIT_MAX_WAIT = 60
+VT_STALE_MAX_AGE_DAYS = 365
 
 DEEPDIVE_MAX_AGE_DAYS = 365
 
@@ -50,6 +51,14 @@ _ALLOWED_API_HOSTS = (
     'urlscan.io', 'rdap.org', 'otx.alienvault.com',
     'www.virustotal.com', 'api.abuseipdb.com',
 )
+
+# --- Analyst-maintained whitelist (URL skip-list) ----------------------------
+WHITELISTED_DOMAINS = {
+    "outlook.com",
+    "microsoft.com",
+    "facebook.com",
+    "instagram.com",
+}
 
 SCORE_SUSPICIOUS = 10
 SCORE_MALICIOUS = 50
@@ -78,6 +87,7 @@ SRC_GSB = "Google Safe Browsing"
 SRC_VT = "VirusTotal"
 SRC_ABUSE = "AbuseIPDB"
 SRC_RDAP = "RDAP"
+SRC_WHITELIST = "Analyst Whitelist"
 
 
 # --- Safe transport -----------------------------------------------------------
@@ -100,7 +110,13 @@ def defang(text):
     text = re.sub(r'(?i)http', 'hxxp', text)
     text = re.sub(r'\b(?:\d{1,3}\.){3}\d{1,3}\b',
                   lambda m: m.group(0).replace('.', '[.]'), text)
-    text = re.sub(r'(?<!\bheader)(?<!\bsmtp)(?<!\bcompauth)\.(?=[a-zA-Z]{2,}\b)', '[.]', text)
+    # Defang dots, but NEVER a dot inside an email local-part (the part before
+    # the @), so name.surname@email.com -> name.surname@email[.]com (only the
+    # domain is defanged). The (?![local]*@) lookahead skips any dot that is
+    # followed by local-part characters and then an @.
+    text = re.sub(
+        r'(?<!\bheader)(?<!\bsmtp)(?<!\bcompauth)\.(?![a-zA-Z0-9._%+-]*@)(?=[a-zA-Z]{2,}\b)',
+        '[.]', text)
     return text
 
 
@@ -137,7 +153,13 @@ def get_status_emoji(status):
         'pass': f"{status} ✅", 'fail': f"{status} ❌", 'softfail': f"{status} ⚠️",
         'temperror': f"{status} 🛠️", 'permerror': f"{status} 🛠️",
         'none': f"{status} ❔", 'neutral': f"{status} ❔",
-    }.get(status, status or 'unknown')
+        # Heuristic / partial / ambiguous outcomes worth a human glance.
+        'bestguesspass': f"{status} 👀",   # dmarc: no published record, MS "best guess" passed
+        'softpass': f"{status} 👀",        # compauth: weak/partial composite pass
+        'unknown': f"{status} ❔",          # compauth: could not be determined
+        'policy': f"{status} ⚠️",          # dkim: signature valid but rejected by local policy
+        'error': f"{status} 🛠️",
+    }.get(status, f"{status} 👀" if status else "unknown ❔")
 
 
 def parse_auth_results(auth_header):
@@ -150,6 +172,11 @@ def parse_auth_results(auth_header):
             proto, status = m.group(1).lower(), m.group(2).lower()
             part = re.sub(r'^(spf|dkim|dmarc|compauth|arc)=[a-zA-Z0-9]+',
                           f"{proto}={get_status_emoji(status)}", part, flags=re.IGNORECASE)
+            if proto == 'compauth':
+                rm = re.search(r'reason=(\d+)', part)
+                if rm:
+                    gloss, _emoji = _compauth_reason_info(rm.group(1))
+                    part = f"{part} ({gloss})"
         lines.append("* " + part)
     return defang("\n".join(lines))
 
@@ -248,6 +275,23 @@ def registrable_domain(host):
     if ext.domain and ext.suffix:
         return f"{ext.domain}.{ext.suffix}"
     return None
+
+
+def _build_whitelist(domains):
+    """Normalise the analyst whitelist to a set of EXACT lower-cased hostnames.
+    Matching is exact: 'microsoft.com' skips only the host 'microsoft.com', NOT
+    'portal.microsoft.com'. To whitelist a subdomain, list it explicitly. Accepts
+    bare hosts or full URLs; scheme/path/port/trailing-dot are stripped. Invalid
+    entries are silently dropped."""
+    hosts = set()
+    for d in domains:
+        if not d:
+            continue
+        host = extract_host(d) or str(d)
+        host = host.split(':')[0].strip().lower().rstrip('.')
+        if host:
+            hosts.add(host)
+    return hosts
 
 
 def is_scannable(observable):
@@ -360,10 +404,16 @@ def poll_result(api_url, headers):
         try:
             resp = _safe_request('GET', api_url, headers=headers, verify = False)
         except (requests.RequestException, ValueError):
-            return None, "network error ⚠️"
+            # Transient network blip — keep waiting, don't abandon the scan.
+            time.sleep(URLSCAN_POLL_INTERVAL)
+            continue
         if resp.status_code == 200:
             return resp.json(), None
-        if resp.status_code == 404:
+        # 404 = result not ready yet; 429/5xx = transient while urlscan is still
+        # assembling the result. Keep polling until the deadline instead of
+        # bailing out on the first non-200 (a mid-scan 500 must NOT be reported
+        # as a final verdict).
+        if resp.status_code == 404 or resp.status_code == 429 or resp.status_code >= 500:
             time.sleep(URLSCAN_POLL_INTERVAL)
             continue
         return None, f"result HTTP {resp.status_code} ❌"
@@ -388,6 +438,33 @@ def get_screenshot_url(res_data):
     return f"https://urlscan.io/screenshots/{uuid}.png" if uuid else None
 
 
+def urlscan_scan_failed(res_data):
+    """True when urlscan returned a *completed* report but never actually loaded
+    the target site — the 'We could not scan this website!' case (DNS/network
+    failure, weak TLS, HTTP authentication required, ...).
+
+    In that situation `verdicts.overall` reads malicious=false / score=0 simply
+    because there was no page to judge, so reporting CLEAN would be wrong. We
+    only conclude failure when NOTHING was retrieved: no server IP was
+    contacted, no HTTP status was recorded, and no request returned any bytes.
+    (Requiring all three avoids false positives from a page that loaded fine but
+    pulled one resource from a sub-domain that failed.)"""
+    lists = res_data.get('lists') or {}
+    page = res_data.get('page') or {}
+    data = res_data.get('data') or {}
+
+    contacted_ip = bool(lists.get('ips')) or bool(page.get('ip'))
+    has_status = page.get('status') is not None
+    requests = data.get('requests') or []
+    got_bytes = any(
+        ((r.get('response') or {}).get('dataLength') or 0) > 0
+        or ((r.get('response') or {}).get('encodedDataLength') or 0) > 0
+        or (((r.get('response') or {}).get('response') or {}).get('status') is not None)
+        for r in requests
+    )
+    return not (contacted_ip or has_status or got_bytes)
+
+
 # --- AlienVault OTX -----------------------------------------------------------
 
 def _otx_headers():
@@ -404,7 +481,11 @@ def _otx_link(itype, indicator):
 
 def otx_lookup(observable, headers):
     """Conservative OTX verdict: whitelisted -> Clean, pulses>=threshold ->
-    Suspicious, otherwise Clean. Pulse membership alone is never Malicious."""
+    Suspicious, otherwise Clean. Pulse membership alone is never Malicious.
+
+    NOTE: the OTX `whitelisted` flag is recorded and surfaced on the domain line
+    for context, but it no longer drives the URL skip-list — that is handled by
+    the analyst-maintained WHITELISTED_DOMAINS set in run_osint()."""
     host = extract_host(observable)
     if not host:
         return {"verdict": "Unknown", "pulses": None, "whitelisted": False, "link": None}
@@ -443,13 +524,46 @@ def _vt_headers():
     return {'x-apikey': os.getenv('VIRUSTOTAL_DAEMON'), 'Accept': 'application/json'}
 
 
+def _vt_normalize_url(url):
+    """Mirror VirusTotal's URL canonicalization closely enough that the base64
+    id we compute matches the object VT actually stored. The big gotcha is the
+    trailing slash: VT keeps 'https://googleabc.com' under the id for
+    'https://googleabc.com/', so a literal base64 of the bare form 404s even
+    though the report exists. We also lower-case the scheme and host."""
+    try:
+        p = urlparse(url)
+    except ValueError:
+        return url
+    scheme = (p.scheme or 'http').lower()
+    netloc = p.netloc.lower()
+    path = p.path or '/'
+    return urlunparse((scheme, netloc, path, p.params, p.query, p.fragment))
+
+
+def _vt_url_id(url):
+    return base64.urlsafe_b64encode(url.encode()).decode().strip('=')
+
+
+def _vt_url_endpoints(observable):
+    """Candidate (api, gui) pairs for a URL — VT-normalized form first, raw form
+    as a fallback (deduped)."""
+    out, seen = [], set()
+    for u in (_vt_normalize_url(observable), observable):
+        uid = _vt_url_id(u)
+        if uid in seen:
+            continue
+        seen.add(uid)
+        out.append((f"https://www.virustotal.com/api/v3/urls/{uid}",
+                    f"https://www.virustotal.com/gui/url/{uid}"))
+    return out
+
+
 def _vt_object_endpoint(observable):
     """Return (api_url, gui_url, kind) for a URL / IP / domain."""
     host = extract_host(observable)
     if observable.startswith(('http://', 'https://')):
-        url_id = base64.urlsafe_b64encode(observable.encode()).decode().strip('=')
-        return (f"https://www.virustotal.com/api/v3/urls/{url_id}",
-                f"https://www.virustotal.com/gui/url/{url_id}", 'urls')
+        api, gui = _vt_url_endpoints(observable)[0]
+        return (api, gui, 'urls')
     if _is_ip(host):
         return (f"https://www.virustotal.com/api/v3/ip_addresses/{host}",
                 f"https://www.virustotal.com/gui/ip-address/{host}", 'ip_addresses')
@@ -488,9 +602,9 @@ def _poll_vt_analysis(analysis_id, headers, max_wait, poll):
     return False
 
 
-def vt_reanalyze(observable, headers):
-    """Ask VT to refresh an existing report and wait (bounded) for it to complete."""
-    api = _vt_object_endpoint(observable)[0]
+def _vt_reanalyze_api(api, headers):
+    """POST {api}/analyse to refresh an existing report, then wait (bounded) for
+    the new analysis to finish. Returns True on completion."""
     try:
         resp = _safe_request('POST', f"{api}/analyse", headers=headers, verify = False)
         analysis_id = ((resp.json() or {}).get('data') or {}).get('id')
@@ -500,6 +614,17 @@ def vt_reanalyze(observable, headers):
         return False
     return _poll_vt_analysis(analysis_id, headers,
                              VT_REANALYZE_MAX_WAIT, VT_REANALYZE_POLL)
+
+
+def _vt_stale(last_analysis_epoch):
+    """True when VT's last analysis is older than VT_STALE_MAX_AGE_DAYS, so the
+    report is worth refreshing before we trust it."""
+    if not last_analysis_epoch:
+        return False
+    try:
+        return (time.time() - float(last_analysis_epoch)) > VT_STALE_MAX_AGE_DAYS * 86400
+    except (TypeError, ValueError):
+        return False
 
 
 def vt_submit_url(url, headers):
@@ -523,25 +648,62 @@ def vt_submit_url(url, headers):
 
 def vt_lookup(observable, headers, reanalyze=False, allow_submit=False):
     api, gui, kind = _vt_object_endpoint(observable)
-    reanalyzed = vt_reanalyze(observable, headers) if reanalyze else False
     out = {"verdict": "Unknown", "malicious": 0, "suspicious": 0, "total": 0,
            "reputation": None, "gui": gui, "absent": False,
-           "reanalyzed": reanalyzed, "submitted": False}
+           "reanalyzed": False, "submitted": False, "stale": False}
+
+    if reanalyze:  # legacy forced pre-fetch reanalyze (off by default)
+        out["reanalyzed"] = _vt_reanalyze_api(api, headers)
+
+    # For URLs, VT canonicalizes the URL, so try the normalized id first and the
+    # raw id as a fallback. Domains/IPs have a single endpoint.
+    candidates = _vt_url_endpoints(observable) if kind == 'urls' else [(api, gui)]
+
+    resp = None
+    used_api, used_gui = candidates[0]
+    for cand_api, cand_gui in candidates:
+        try:
+            r = _safe_request('GET', cand_api, headers=headers, verify = False)
+        except (requests.RequestException, ValueError):
+            continue
+        resp, used_api, used_gui = r, cand_api, cand_gui
+        if r.status_code == 200:
+            break  # found the stored object
+
+    # URL VT has never seen → submit it (same as the website's search box), wait
+    # for the analysis, then re-fetch the normalized id.
+    if (resp is None or resp.status_code == 404) and kind == 'urls' and allow_submit:
+        if vt_submit_url(_vt_normalize_url(observable), headers):
+            out["submitted"] = True
+            used_api, used_gui = candidates[0]
+            try:
+                resp = _safe_request('GET', used_api, headers=headers, verify = False)
+            except (requests.RequestException, ValueError):
+                resp = None
+
+    if resp is None:
+        return out
+
     try:
-        resp = _safe_request('GET', api, headers=headers, verify = False)
-        # URL VT has never seen → submit it (same as searching it on the site),
-        # wait for the analysis to finish, then re-fetch.
-        if resp.status_code == 404 and kind == 'urls' and allow_submit:
-            if vt_submit_url(observable, headers):
-                out["submitted"] = True
-                resp = _safe_request('GET', api, headers=headers, verify = False)
         if resp.status_code == 200:
             data = resp.json().get('data') or {}
             attrs = data.get('attributes') or {}
+            # Report older than a year → reanalyze, wait, and re-read it.
+            if _vt_stale(attrs.get('last_analysis_date')):
+                out["stale"] = True
+                if _vt_reanalyze_api(used_api, headers):
+                    out["reanalyzed"] = True
+                    try:
+                        r2 = _safe_request('GET', used_api, headers=headers, verify = False)
+                        if r2.status_code == 200:
+                            data = r2.json().get('data') or {}
+                            attrs = data.get('attributes') or {}
+                    except (requests.RequestException, ValueError):
+                        pass
             verdict, malicious, suspicious, total = _vt_verdict_from_stats(
                 attrs.get('last_analysis_stats') or {})
             out.update(verdict=verdict, malicious=malicious, suspicious=suspicious,
-                       total=total, reputation=attrs.get('reputation'))
+                       total=total, reputation=attrs.get('reputation'), gui=used_gui)
             if kind == 'urls' and data.get('id'):
                 out["gui"] = f"https://www.virustotal.com/gui/url/{data['id']}"
         elif resp.status_code == 404:
@@ -618,31 +780,41 @@ def build_url_record(url, urlscan_outcome):
         urlscan_field = note = urlscan_outcome["message"]
 
     if res_data is not None:
-        verdicts = res_data.get('verdicts') or {}
-        overall = verdicts.get('overall') or {}
-        urlscan_v = verdicts.get('urlscan') or {}
-        us_malicious = bool(overall.get('malicious') or urlscan_v.get('malicious'))
-        score = overall.get('score', urlscan_v.get('score'))
-        gsb_malicious = _gsb_malicious(res_data)
         screenshot = get_screenshot_url(res_data)
-        urlscan_field = "malicious" if us_malicious else "clean"
-        gsb_field = "malicious" if gsb_malicious else "clean"
+        if urlscan_scan_failed(res_data):
+            # urlscan returned a report, but the site itself was never loaded
+            # (the "We could not scan this website!" page). overall.malicious is
+            # false / score 0 only because there was no page to judge — so this
+            # is UNKNOWN, never clean. Two-Source Verification (VT) then decides.
+            urlscan_field = "could not scan (site unreachable)"
+            note = ("urlscan could not load the site — DNS/network failure, "
+                    "weak TLS, or HTTP authentication required")
+            verdict = "Unknown"
+        else:
+            verdicts = res_data.get('verdicts') or {}
+            overall = verdicts.get('overall') or {}
+            urlscan_v = verdicts.get('urlscan') or {}
+            us_malicious = bool(overall.get('malicious') or urlscan_v.get('malicious'))
+            score = overall.get('score', urlscan_v.get('score'))
+            gsb_malicious = _gsb_malicious(res_data)
+            urlscan_field = "malicious" if us_malicious else "clean"
+            gsb_field = "malicious" if gsb_malicious else "clean"
 
-        if us_malicious or gsb_malicious or (isinstance(score, (int, float)) and score >= SCORE_MALICIOUS):
-            verdict = "Malicious"
-        elif isinstance(score, (int, float)) and score >= SCORE_SUSPICIOUS:
-            verdict = "Suspicious"
-        else:
-            verdict = "Clean"
+            if us_malicious or gsb_malicious or (isinstance(score, (int, float)) and score >= SCORE_MALICIOUS):
+                verdict = "Malicious"
+            elif isinstance(score, (int, float)) and score >= SCORE_SUSPICIOUS:
+                verdict = "Suspicious"
+            else:
+                verdict = "Clean"
 
-        if us_malicious or (isinstance(score, (int, float)) and score >= SCORE_SUSPICIOUS):
-            flagged_by.append(SRC_URLSCAN)
-        else:
-            cleared_by.append(SRC_URLSCAN)
-        if gsb_malicious:
-            flagged_by.append(SRC_GSB)
-        else:
-            cleared_by.append(SRC_GSB)
+            if us_malicious or (isinstance(score, (int, float)) and score >= SCORE_SUSPICIOUS):
+                flagged_by.append(SRC_URLSCAN)
+            else:
+                cleared_by.append(SRC_URLSCAN)
+            if gsb_malicious:
+                flagged_by.append(SRC_GSB)
+            else:
+                cleared_by.append(SRC_GSB)
 
     return {'kind': 'url', 'observable': url, 'verdict': verdict,
             'first_source': SRC_URLSCAN,
@@ -651,19 +823,21 @@ def build_url_record(url, urlscan_outcome):
             'note': note, 'flagged_by': flagged_by, 'cleared_by': cleared_by}
 
 
-def build_whitelisted_url_record(url, parent_domain):
-    """URL skipped because its registrable domain is whitelisted in AlienVault OTX."""
+def build_whitelisted_url_record(url, matched_host):
+    """URL skipped because its host EXACTLY matches an entry in the analyst
+    whitelist (WHITELISTED_DOMAINS)."""
     return {'kind': 'url', 'observable': url, 'verdict': "WhitelistSkip",
-            'first_source': SRC_OTX,
-            'urlscan_field': f"Skipped (parent domain whitelisted in {SRC_OTX})",
+            'first_source': SRC_WHITELIST,
+            'urlscan_field': f"Skipped (host in {SRC_WHITELIST})",
             'gsb_field': None, 'result_url': None, 'screenshot': None,
-            'note': f"parent domain {parent_domain} whitelisted in {SRC_OTX}",
+            'note': f"host {matched_host} in {SRC_WHITELIST}",
             'flagged_by': [], 'cleared_by': []}
 
 
 def build_domain_record(domain, otx_headers):
     """Verdict for a domain comes from AlienVault OTX. Creation date (RDAP) is
-    context only."""
+    context only. The OTX whitelist flag is recorded for display but does not
+    drive the URL skip-list (see WHITELISTED_DOMAINS)."""
     otx = otx_lookup(domain, otx_headers)
     verdict = otx['verdict']
     flagged_by = [SRC_OTX] if verdict in ("Suspicious", "Malicious") else []
@@ -747,6 +921,8 @@ def format_two_source_line(rec):
         parts.append(f"{SRC_RDAP} creation date: {_iso_to_ddmmyyyy(rec.get('created_iso_dd'))}")
     if vt.get('submitted'):
         parts.append(f"{SRC_VT}: submitted on-demand")
+    if vt.get('reanalyzed'):
+        parts.append(f"{SRC_VT}: reanalyzed (report was >1y old)")
     parts.append(f"[{SRC_VT}]({vt['gui']})")
     return (f"* *{defang(rec['observable'])}* — **{verdict_label(rec['combined_verdict'])}** | "
             + " | ".join(parts))
@@ -911,7 +1087,35 @@ def deepdive_escalation(vt, created_iso, kind='domain'):
     return triggers
 
 
-# --- Manual Lookups reason building -------------------------------------------
+# --- Two-source reconciliation ------------------------------------------------
+
+def two_source_verdict(first_verdict, vt, kind):
+    """Reconcile the first-factor verdict with the VirusTotal second factor.
+
+    Severity only ever escalates — a non-clean first factor is NEVER silently
+    downgraded to Clean:
+      * VT (or the first factor) confirms malicious -> Malicious for domains/
+        URLs, Suspicious for IPs.
+      * VT or the first factor is suspicious        -> NeedsReview.
+      * First factor was Unknown and VT came back clean -> NeedsReview (we could
+        not actually scan the item, so a clean VT alone is not enough to clear
+        it — e.g. a URL urlscan could not reach).
+      * First factor was Unknown and VT has no record   -> Unknown (no data at
+        all; never Clean)."""
+    absent = vt.get('absent')
+    vt_verdict = None if absent else vt.get('verdict')
+
+    if vt_verdict == 'Malicious' or first_verdict == 'Malicious':
+        return 'Suspicious' if kind == 'ip' else 'Malicious'
+    if vt_verdict == 'Suspicious' or first_verdict == 'Suspicious':
+        return 'NeedsReview'
+    # Only an Unknown first factor reaches this point.
+    if vt_verdict == 'Clean':
+        return 'NeedsReview'
+    return 'Unknown'
+
+
+# --- Watchlist reason building ------------------------------------------------
 
 def _first_factor_detail(rec):
     """Verbose, source-tagged detail for whichever tool produced the first-
@@ -938,9 +1142,10 @@ def _first_factor_detail(rec):
     return "; ".join(bits) if bits else f"{SRC_URLSCAN}: inconclusive"
 
 
-def build_manual_reason(rec):
-    """Manual Lookups reason: every contributing source gets a mention, so a
-    reader can see which tool flagged what and which tool cleared it."""
+def build_watchlist_reason(rec):
+    """Watchlist reason: every contributing source gets a mention, so a reader
+    can see which tool flagged what, which cleared it, and why it still warrants
+    a look."""
     parts = []
     first_verdict = rec['verdict']
     detail = _first_factor_detail(rec)
@@ -950,8 +1155,7 @@ def build_manual_reason(rec):
     elif first_verdict == "Unknown":
         parts.append(f"{detail} — inconclusive")
     elif first_verdict == "Clean":
-        # Only reached when VT escalated despite a clean first factor.
-        parts.append(f"Cleared by {detail}")
+        parts.append(f"First factor clean ({detail})")
 
     # Second-factor (VT) signal — present iff Two-Source Verification ran.
     if 'vt' in rec:
@@ -962,35 +1166,57 @@ def build_manual_reason(rec):
             parts.append("; ".join(rec['triggers']))
         else:
             vendors = f"{vt.get('malicious', 0)}/{vt.get('total', 0)} malicious"
-            parts.append(f"{SRC_VT}: clean ({vendors})")
+            parts.append(f"{SRC_VT}: {str(vt.get('verdict', '')).lower()} ({vendors})")
+
+    # For URLs, surface the OTX standing of the parent domain for extra context,
+    # so a reader doesn't have to cross-reference the Domains section.
+    if rec.get('kind') == 'url' and rec.get('domain_otx'):
+        dotx = rec['domain_otx']
+        apex = rec.get('apex') or extract_host(rec['observable'])
+        pulses = dotx.get('pulses')
+        parts.append(f"{SRC_OTX} for {defang(apex)}: {dotx.get('verdict', 'Unknown')} "
+                     f"({pulses if pulses is not None else 0} pulses)")
+
+    # Recency note — covers clean items that only tripped the recency rule, and
+    # adds context when Two-Source didn't already mention it.
+    if rec.get('recent') and not any('within the last year' in p for p in parts):
+        created = _iso_to_ddmmyyyy(rec.get('created_iso_dd'))
+        parts.append(f"{SRC_RDAP}: registered within the last year ({created})")
 
     return "; ".join(parts) if parts else "inconclusive"
 
 
-def manual_verdict(rec):
-    """Verdict shown in Manual Lookups. NeedsReview wins when the deep-dive
-    escalated; otherwise the first-factor verdict stands."""
-    if rec.get('combined_verdict') == 'NeedsReview':
+def watchlist_verdict(rec):
+    """Verdict shown on the Watchlist. The two-source combined verdict wins when
+    verification ran; a clean-but-recently-registered item shows NEEDS REVIEW;
+    otherwise the first-factor verdict stands."""
+    cv = rec.get('combined_verdict')
+    if cv in ('Malicious', 'Suspicious', 'Unknown', 'NeedsReview'):
+        return cv
+    if rec.get('recent') and rec['verdict'] == 'Clean':
         return 'NeedsReview'
     return rec['verdict']
 
 
-def needs_manual_review(rec):
-    """An item belongs in Manual Lookups if ANY source raised a concern, even
-    when a later source disagreed."""
+def needs_watchlist(rec):
+    """An item belongs on the Watchlist if ANY source raised a concern (even
+    when a later source disagreed), or if it is a recently-registered
+    domain/URL."""
     if rec['verdict'] == 'WhitelistSkip':
         return False
     if rec['verdict'] in ('Suspicious', 'Malicious', 'Unknown'):
         return True
-    if rec.get('combined_verdict') == 'NeedsReview':
+    if rec.get('combined_verdict') in ('Suspicious', 'Malicious', 'Unknown', 'NeedsReview'):
+        return True
+    if rec.get('recent'):
         return True
     return False
 
 
-def _attachment_manual_entry(att):
-    """Build a Manual Lookups row for an attachment with a worrying VT result.
-    Clean attachments and ones we never looked up (image/video/audio) return
-    None and stay out of the list."""
+def _attachment_watch_entry(att):
+    """Build a Watchlist row for an attachment with a worrying VT result. Clean
+    attachments and ones we never looked up (image/video/audio) return None and
+    stay off the list."""
     vt = att.get('vt')
     if not vt:
         return None
@@ -1006,43 +1232,210 @@ def _attachment_manual_entry(att):
     return None
 
 
-# --- Defender XDR template ----------------------------------------------------
+# --- Header indicators (anti-spam scores, alignment, display-name) ------------
 
-# Only <DEFANGED_SENDER> and <DEFANGED_RECIPIENT> get auto-filled; every other
-# placeholder (counts, subjects, screenshots, users, the optional [ ... ] click
-# block) is left exactly as written for the analyst to complete by hand.
-DEFENDER_XDR_TEMPLATE = """# Defender XDR
----
-* The sender <DEFANGED_SENDER> delivered <NUMBER> email(s) in the last month. [The subject(s) included "<SUBJECT_1>", "<SUBJECT_2>", among others.]
----
-* {No|NUMBER} URL click(s) {was|were} found over the last month.
-  <SCREENSHOT_EXPLORER>
-  <SCREENSHOT_HUNTING>
----
-[ 
-* The URL click(s) {was|were} performed by:
-  * <USER_1>
-  * <USER_2>
----
-* The following are the targeted URL(s):
-  * <DEFANGED_URL> - **Clicked by <USER>**
-]
-* The user <DEFANGED_RECIPIENT> (<BUNIT>) has received <NUMBER> email(s) from <DEFANGED_SENDER> during the last month.
-  <SCREENSHOT_EXPLORER>
----
-* There was [not] interaction with <DEFANGED_SENDER> for the last month.
-  <SCREENSHOT_EXPLORER>"""
+def get_scl(headers):
+    """Spam Confidence Level (-1..9): dedicated header first, then the antispam
+    reports."""
+    val = headers.get('X-MS-Exchange-Organization-SCL')
+    if val is not None:
+        try:
+            return int(str(val).strip())
+        except (TypeError, ValueError):
+            pass
+    for hname in ('X-Forefront-Antispam-Report', 'X-Microsoft-Antispam'):
+        m = re.search(r'\bSCL:(-?\d+)', headers.get(hname, '') or '', re.IGNORECASE)
+        if m:
+            return int(m.group(1))
+    return None
 
 
-def build_defender_xdr_block(headers):
-    """Fill ONLY the sender/recipient placeholders from the parsed headers,
-    leaving the rest of the template untouched. Uses str.replace (not .format)
-    so the literal {No|NUMBER} / {was|were} braces survive verbatim."""
-    sender = defang(parseaddr(headers.get('From', ''))[1]) or "<DEFANGED_SENDER>"
-    recipient = defang(parseaddr(headers.get('To', ''))[1]) or "<DEFANGED_RECIPIENT>"
-    return (DEFENDER_XDR_TEMPLATE
-            .replace('<DEFANGED_SENDER>', sender)
-            .replace('<DEFANGED_RECIPIENT>', recipient))
+def get_bcl(headers):
+    """Bulk Complaint Level (0..9) from the Microsoft antispam headers."""
+    for hname in ('X-Microsoft-Antispam', 'X-Forefront-Antispam-Report'):
+        m = re.search(r'\bBCL:(\d+)', headers.get(hname, '') or '', re.IGNORECASE)
+        if m:
+            return int(m.group(1))
+    return None
+
+
+def _scl_label(scl):
+    if scl < 0:
+        return f"{scl} — bypassed spam filtering (allow-listed / internal) ✅"
+    if scl <= 1:
+        return f"{scl} — not spam ✅"
+    if scl <= 4:
+        return f"{scl} — undetermined ❔"
+    if scl <= 6:
+        return f"{scl} — spam ⚠️"
+    return f"{scl} — high-confidence spam 📛"
+
+
+def _bcl_label(bcl):
+    if bcl == 0:
+        return f"{bcl} — not from a bulk sender ✅"
+    if bcl <= 3:
+        return f"{bcl} — low bulk-complaint level ✅"
+    if bcl <= 7:
+        return f"{bcl} — moderate bulk-complaint level ⚠️"
+    return f"{bcl} — high bulk-complaint level 📛"
+
+
+def _compauth_reason_info(code):
+    """(gloss, emoji) for a Microsoft compauth reason code. Named codes first,
+    otherwise bucketed by the leading digit."""
+    code = str(code)
+    specific = {
+        '000': ('composite auth failed — sender published DMARC and it failed (explicit fail)', '❌'),
+        '001': ('composite auth failed — implicit fail (no usable SPF/DKIM/DMARC)', '❌'),
+        '002': ('overridden by an org policy / mail-flow rule', '⚠️'),
+        '010': ('DMARC failed; the domain policy is p=reject/quarantine', '❌'),
+        '100': ('passed — no DMARC record; composite auth passed via SPF and/or DKIM', '✅'),
+    }
+    if code in specific:
+        return specific[code]
+    if code.startswith('1'):
+        return ('composite authentication passed', '✅')
+    if code.startswith('2'):
+        return ('passed, but the sender was allow-listed / overridden', '⚠️')
+    if code.startswith('3'):
+        return ('failed, but delivered due to an allow-list / override', '⚠️')
+    if code.startswith('0'):
+        return ('composite authentication failed', '❌')
+    return ('see Microsoft compauth reason-code reference', '👀')
+
+
+def _dkim_alignment_line(headers, from_host):
+    """DMARC-style DKIM alignment. Compare the FULL From host against each
+    passing DKIM signature's d= host: an exact match is strict alignment; a
+    shared registrable (organizational) domain is relaxed alignment; neither is
+    a misalignment."""
+    ar = " ".join(" ".join(headers.get_all('Authentication-Results') or []).split())
+    if not ar:
+        return None
+    sigs = []
+    for part in ar.split(';'):
+        part = part.strip()
+        sm = re.match(r'dkim=([a-zA-Z]+)', part, re.IGNORECASE)
+        if not sm:
+            continue
+        dm = re.search(r'header\.d=([A-Za-z0-9.\-]+)', part, re.IGNORECASE)
+        d_host = dm.group(1).lower().rstrip('.') if dm else None
+        sigs.append((sm.group(1).lower(), d_host))
+    if not sigs:
+        return None
+    if not from_host:
+        return "* **DKIM alignment:** From domain unknown ❔"
+    from_reg = registrable_domain(from_host)
+    passing = [s for s in sigs if s[0] == 'pass' and s[1]]
+    strict = [s for s in passing if s[1] == from_host]
+    relaxed = [s for s in passing
+               if registrable_domain(s[1]) and registrable_domain(s[1]) == from_reg]
+    if strict:
+        return (f"* **DKIM alignment:** aligned — strict ✅ "
+                f"(header.d={defang(strict[0][1])} ↔ From {defang(from_host)})")
+    if relaxed:
+        return (f"* **DKIM alignment:** aligned — relaxed ✅ "
+                f"(header.d={defang(relaxed[0][1])} ↔ From {defang(from_host)}; "
+                f"same org domain {defang(from_reg)}, subdomains differ)")
+    signed = ", ".join(f"{defang(s[1])} [{s[0]}]" for s in sigs if s[1]) or "n/a"
+    return (f"* **DKIM alignment:** not aligned ⚠️ "
+            f"(no passing DKIM matched From {defang(from_host)}; signed by {signed})")
+
+
+def _decode_idna(host):
+    try:
+        return host.encode('ascii').decode('idna')
+    except Exception:
+        return None
+
+
+def _display_name_flags(name, from_dom):
+    """Brand / look-alike spoofing signals in the From display name: an embedded
+    address or domain whose registrable domain differs from the real sender."""
+    flags, seen = [], set()
+    if not name:
+        return flags
+    for em in re.findall(r'[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}', name):
+        d = registrable_domain(em.split('@')[-1].lower())
+        if d and from_dom and d != from_dom and d not in seen:
+            seen.add(d)
+            flags.append(f"display name embeds the address {defang(em)} "
+                         f"(domain {defang(d)} ≠ actual sender {defang(from_dom)})")
+    for dom in re.findall(r'\b(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}\b', name):
+        d = registrable_domain(dom.lower())
+        if d and from_dom and d != from_dom and d not in seen:
+            seen.add(d)
+            flags.append(f"display name mentions the domain {defang(dom)} "
+                         f"(≠ actual sender {defang(from_dom)})")
+    return flags
+
+
+def _punycode_flags(from_host, name):
+    """Flag punycode / IDN domains (xn--) in the sender or display name and
+    decode them, so a homograph look-alike is visible to the analyst."""
+    flags, candidates = [], set()
+    if from_host:
+        candidates.add(from_host)
+    for dom in re.findall(r'\b(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}\b', name or ''):
+        candidates.add(dom.lower())
+    for host in candidates:
+        if any(lbl.startswith('xn--') for lbl in host.split('.')):
+            decoded = _decode_idna(host)
+            extra = f" → decodes to \u201c{decoded}\u201d" if decoded else ""
+            flags.append(f"punycode/IDN domain {defang(host)}{extra} "
+                         f"— possible homograph / look-alike")
+    return flags
+
+
+def build_indicators_block(headers):
+    """Anti-spam scores + alignment + display-name checks. Returns a list of
+    already-defanged markdown lines, or [] if there's nothing to show."""
+    lines = []
+    from_name, from_addr = parseaddr(headers.get('From', '') or '')
+    from_name = decode_mime_words(from_name) if from_name else ''
+    if from_name == "Not Found":
+        from_name = ''
+    from_host = from_addr.split('@')[-1].lower() if '@' in from_addr else ''
+    from_dom = registrable_domain(from_host)
+
+    scl = get_scl(headers)
+    if scl is not None:
+        lines.append(f"* **SCL (Spam Confidence Level):** {_scl_label(scl)}")
+    bcl = get_bcl(headers)
+    if bcl is not None:
+        lines.append(f"* **BCL (Bulk Complaint Level):** {_bcl_label(bcl)}")
+
+    align = _dkim_alignment_line(headers, from_host)
+    if align:
+        lines.append(align)
+
+    rp_dom = registrable_domain(extract_domain(headers.get('Return-Path', '')) or '')
+    rt_dom = registrable_domain(extract_domain(headers.get('Reply-To', '')) or '')
+    if rp_dom:
+        if rp_dom == from_dom:
+            lines.append(f"* **From ↔ Return-Path:** aligned ✅ (same org domain {defang(from_dom)})")
+        else:
+            lines.append(f"* **From ↔ Return-Path:** mismatch ⚠️ "
+                         f"(From {defang(from_dom)} vs Return-Path {defang(rp_dom)})")
+    if rt_dom:
+        if rt_dom == from_dom:
+            lines.append(f"* **From ↔ Reply-To:** aligned ✅ (same org domain {defang(from_dom)})")
+        else:
+            lines.append(f"* **From ↔ Reply-To:** mismatch ⚠️ "
+                         f"(From {defang(from_dom)} vs Reply-To {defang(rt_dom)})")
+
+    spoof = _display_name_flags(from_name, from_dom) + _punycode_flags(from_host, from_name)
+    if spoof:
+        lines.append("* **Display-name check:** spoofing indicators 📛")
+        for fl in spoof:
+            lines.append(f"  * {fl}")
+    elif from_dom:
+        shown = defang(from_name) if from_name else "(no display name)"
+        lines.append(f"* **Display-name check:** no look-alike detected ✅ "
+                     f"(\"{shown}\" / {defang(from_dom)})")
+
+    return lines
 
 
 # --- The main pipeline --------------------------------------------------------
@@ -1056,7 +1449,12 @@ def run_osint(raw_header_text, headers, url_obs, domain_obs, raw_bytes):
 
     # --- Domains: AlienVault OTX is the sole first-factor verdict source ---
     domain_records = [build_domain_record(d, otx_headers) for d in domain_obs]
-    whitelisted_apexes = {r['observable'] for r in domain_records if r.get('whitelisted')}
+
+    # The URL skip-list is the analyst-maintained whitelist, NOT OTX's whitelist.
+    # OTX's whitelisted flag is still surfaced on each domain line for context,
+    # but it no longer decides which URLs get skipped — and matching is EXACT on
+    # the host (a 'microsoft.com' entry does not cover 'careers.microsoft.com').
+    whitelist_hosts = _build_whitelist(WHITELISTED_DOMAINS)
 
     print("### Domains")
     print("---")
@@ -1069,16 +1467,16 @@ def run_osint(raw_header_text, headers, url_obs, domain_obs, raw_bytes):
     # --- URLs: URLScan.io is the sole first-factor verdict source ---
     pending = {}
     for u in url_obs:
-        if registrable_domain(extract_host(u)) in whitelisted_apexes:
+        if extract_host(u) in whitelist_hosts:
             continue
         pending[u] = submit_scan(u, us_headers)
         time.sleep(URLSCAN_SUBMIT_THROTTLE)
 
     url_records = []
     for u in url_obs:
-        apex = registrable_domain(extract_host(u))
-        if apex in whitelisted_apexes:
-            url_records.append(build_whitelisted_url_record(u, apex))
+        host = extract_host(u)
+        if host in whitelist_hosts:
+            url_records.append(build_whitelisted_url_record(u, host))
         else:
             url_records.append(build_url_record(u, pending.get(u)))
 
@@ -1133,7 +1531,7 @@ def run_osint(raw_header_text, headers, url_obs, domain_obs, raw_bytes):
             rec['vt_verdict'] = vt['verdict']
             rec['created_iso_dd'] = created_iso
             rec['triggers'] = triggers
-            rec['combined_verdict'] = 'NeedsReview' if triggers else 'Clean'
+            rec['combined_verdict'] = two_source_verdict(rec['verdict'], vt, rec['kind'])
             if vt['verdict'] in ('Suspicious', 'Malicious') and SRC_VT not in rec['flagged_by']:
                 rec['flagged_by'].append(SRC_VT)
             elif vt['verdict'] == 'Clean' and SRC_VT not in rec['cleared_by']:
@@ -1170,22 +1568,40 @@ def run_osint(raw_header_text, headers, url_obs, domain_obs, raw_bytes):
         print(line)
 
     print("---")
-    print("### Manual Lookups")
+    print("### Watchlist")
     print("---")
 
-    manual = []
+    # A recently-registered domain/URL belongs on the watchlist even when every
+    # scanner came back clean, so compute recency for all domain/URL records
+    # (creation date is cached, so this is essentially free). IPs have none.
+    # While here, attach each URL's parent-domain OTX standing for context.
+    otx_by_apex = {dr['observable']: dr.get('otx') for dr in domain_records}
+    for rec in domain_records + url_records:
+        if rec['kind'] == 'ip' or rec['verdict'] == 'WhitelistSkip':
+            continue
+        if rec['kind'] == 'url':
+            apex = registrable_domain(extract_host(rec['observable']))
+            rec['apex'] = apex
+            rec['domain_otx'] = otx_by_apex.get(apex)
+        created_iso = rec.get('created_iso_dd')
+        if created_iso is None:
+            created_iso = _record_created_iso(rec)
+            rec['created_iso_dd'] = created_iso
+        rec['recent'] = bool(created_iso and _within_one_year(created_iso))
+
+    watch = []
     for rec in url_records + domain_records + ip_records:
-        if needs_manual_review(rec):
-            manual.append({'observable': rec['observable'],
-                           'verdict': manual_verdict(rec),
-                           'reason': build_manual_reason(rec)})
+        if needs_watchlist(rec):
+            watch.append({'observable': rec['observable'],
+                          'verdict': watchlist_verdict(rec),
+                          'reason': build_watchlist_reason(rec)})
     for a in atts:
-        entry = _attachment_manual_entry(a)
+        entry = _attachment_watch_entry(a)
         if entry:
-            manual.append(entry)
+            watch.append(entry)
 
     seen, deduped = set(), []
-    for m in manual:
+    for m in watch:
         if m['observable'] in seen:
             continue
         seen.add(m['observable'])
@@ -1197,7 +1613,7 @@ def run_osint(raw_header_text, headers, url_obs, domain_obs, raw_bytes):
         for m in deduped:
             print(f"* *{defang(m['observable'])}* — **{verdict_label(m['verdict'])}** — {m['reason']}")
     else:
-        print("*Nothing requires manual review.*")
+        print("*Nothing on the watchlist.*")
 
 
 def analyze_headers(raw_header_text, raw_bytes=None):
@@ -1223,14 +1639,18 @@ def analyze_headers(raw_header_text, raw_bytes=None):
     print("```")
     print("---")
 
+    indicators = build_indicators_block(headers)
+    if indicators:
+        print("## Anti-Spam & Spoofing Indicators")
+        print("---")
+        for ln in indicators:
+            print(ln)
+        print("---")
+
     url_obs, domain_obs = collect_observables(raw_header_text, headers)
     print("## OSINT Lookups")
     print("---")
     run_osint(raw_header_text, headers, url_obs, domain_obs, raw_bytes)
-
-    print()
-    print()
-    print(build_defender_xdr_block(headers))
 
 
 if __name__ == "__main__":
