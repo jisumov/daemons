@@ -1,1 +1,1 @@
-...are a dev's best friend.
+<img src="daemons.png" alt="Daemons cover" width="1024">
