@@ -1,1 +1,1 @@
-<img src="daemons.png" alt="Daemons cover" width="1024">
+<img src="daemons.png" alt="Daemons" width="1024">
