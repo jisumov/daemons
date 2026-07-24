@@ -44,6 +44,18 @@ VT_STALE_MAX_AGE_DAYS = 365
 
 DEEPDIVE_MAX_AGE_DAYS = 365
 
+# --- Effective-URL discovery ---------------------------------------------------
+# urlscan reports both the URL we submitted (task.url) and the URL the browser
+# actually ended up on (page.url) — the "Effective URL" on the report page. When
+# they differ, the landing page is a DIFFERENT observable that nothing has
+# looked at yet, so it is scanned in its own right: URLScan.io first, then
+# VirusTotal as the second source (forced, see FORCE_TWO_SOURCE_ON_DISCOVERED),
+# and its apex domain goes to OTX if it is new.
+FOLLOW_EFFECTIVE_URLS = True
+DISCOVERY_MAX_URLS = 5        # hard cap on redirect targets pulled in per run
+DISCOVERY_MAX_ROUNDS = 2      # a target that itself redirects is followed again
+FORCE_TWO_SOURCE_ON_DISCOVERED = True
+
 _SKIPPED_ATTACHMENT_MAINTYPES = ('image', 'video', 'audio')
 ABUSEIPDB_MAX_AGE_DAYS = 90
 ABUSEIPDB_MAX_IPS = 15
@@ -504,6 +516,14 @@ def rdap_creation_date(apex_domain):
 
 # --- URLScan.io ---------------------------------------------------------------
 
+# Schemes that never represent traffic to the target site. When a navigation
+# fails, Chrome renders its own error page from chrome-error://chromewebdata/
+# and inlines its artwork as data: URIs — those requests report HTTP 200 and a
+# non-zero dataLength, which must NOT be read as "the site answered".
+_NON_NETWORK_SCHEMES = ('data:', 'blob:', 'about:', 'chrome:', 'chrome-error:',
+                        'chrome-extension:', 'javascript:', 'filesystem:')
+
+
 def _urlscan_headers():
     return {'API-Key': os.getenv('URLSCAN_DAEMON'), 'Content-Type': 'application/json'}
 
@@ -573,6 +593,89 @@ def get_screenshot_url(scan_result_data):
     return f"https://urlscan.io/screenshots/{scan_uuid}.png" if scan_uuid else None
 
 
+def _canonical_url(url):
+    """Loose canonical form used only to compare/deduplicate URLs: lower-cased
+    scheme and host, '/' for an empty path, no trailing slash beyond the root,
+    fragment dropped. So 'https://Example.com' , 'https://example.com/' and
+    'https://example.com/#top' all collapse to the same key."""
+    try:
+        parsed_url = urlparse((url or '').strip())
+    except ValueError:
+        return (url or '').strip().lower()
+    url_scheme = (parsed_url.scheme or 'https').lower()
+    network_location = parsed_url.netloc.lower()
+    url_path = parsed_url.path or '/'
+    if url_path != '/':
+        url_path = url_path.rstrip('/') or '/'
+    return urlunparse((url_scheme, network_location, url_path,
+                       parsed_url.params, parsed_url.query, ''))
+
+
+def urlscan_effective_url(scan_result_data):
+    """The URL the browser actually ended up on (`page.url` — urlscan's
+    "Effective URL"), or None when the report doesn't carry a usable one."""
+    page_url = ((scan_result_data.get('page') or {}).get('url') or '').strip()
+    return page_url if page_url.lower().startswith(('http://', 'https://')) else None
+
+
+def urlscan_redirect_chain(scan_result_data, submitted_url):
+    """(hops, initiators) for the navigation that produced this report.
+
+    `hops` starts at the submitted URL and ends at the effective URL, so a
+    single-element list means nothing redirected. Hops come from
+    `data.redirects` (which also names what caused each one — 'script' for a
+    JS/meta redirect, otherwise an HTTP 3xx), and `page.url` is appended in
+    case urlscan recorded the landing page without a redirect entry."""
+    navigation_hops = [submitted_url]
+    hop_initiators = []
+    for redirect_entry in (scan_result_data.get('data') or {}).get('redirects') or []:
+        redirect_target = (redirect_entry.get('to') or '').strip()
+        if (redirect_target.lower().startswith(('http://', 'https://'))
+                and _canonical_url(redirect_target) != _canonical_url(navigation_hops[-1])):
+            navigation_hops.append(redirect_target)
+            hop_initiators.append(redirect_entry.get('initiator'))
+    effective_url = urlscan_effective_url(scan_result_data)
+    if effective_url and _canonical_url(effective_url) != _canonical_url(navigation_hops[-1]):
+        navigation_hops.append(effective_url)
+        hop_initiators.append(None)
+    return navigation_hops, [hop_initiator for hop_initiator in hop_initiators if hop_initiator]
+
+
+def _is_network_request(recorded_request):
+    """True only for real http(s) traffic. Chrome's own error page
+    (chrome-error://chromewebdata/) and the data: images it inlines are NOT
+    evidence that the target site responded."""
+    request_block = recorded_request.get('request') or {}
+    request_url = ((request_block.get('request') or {}).get('url') or '').strip().lower()
+    document_url = (request_block.get('documentURL') or '').strip().lower()
+    if not request_url.startswith(('http://', 'https://')):
+        return False
+    return not document_url.startswith(_NON_NETWORK_SCHEMES)
+
+
+def urlscan_primary_error(scan_result_data):
+    """errorText of the failed main-document request ('net::ERR_NAME_NOT_RESOLVED',
+    'net::ERR_CONNECTION_REFUSED', ...), or None when the main document didn't
+    fail. Canceled requests are ignored on purpose: the ERR_ABORTED urlscan logs
+    while tearing the tab down is a consequence of the real failure, not its
+    cause, and reporting it would hide the useful error."""
+    page_url = ((scan_result_data.get('page') or {}).get('url')
+                or (scan_result_data.get('task') or {}).get('url') or '').strip().lower()
+    fallback_error = None
+    for recorded_request in (scan_result_data.get('data') or {}).get('requests') or []:
+        request_block = recorded_request.get('request') or {}
+        failure_block = (recorded_request.get('response') or {}).get('failed') or {}
+        error_text = failure_block.get('errorText')
+        if not error_text or failure_block.get('canceled'):
+            continue
+        request_url = ((request_block.get('request') or {}).get('url') or '').strip().lower()
+        if request_block.get('primaryRequest') or (page_url and request_url == page_url):
+            return error_text
+        if request_block.get('type') == 'Document' and fallback_error is None:
+            fallback_error = error_text
+    return fallback_error
+
+
 def urlscan_scan_failed(scan_result_data):
     """True when urlscan returned a *completed* report but never actually loaded
     the target site — the 'We could not scan this website!' case (DNS/network
@@ -583,22 +686,45 @@ def urlscan_scan_failed(scan_result_data):
     only conclude failure when NOTHING was retrieved: no server IP was
     contacted, no HTTP status was recorded, and no request returned any bytes.
     (Requiring all three avoids false positives from a page that loaded fine but
-    pulled one resource from a sub-domain that failed.)"""
+    pulled one resource from a sub-domain that failed.)
+
+    Two categories of request are excluded from the byte check, because both
+    describe Chrome's error page rather than the target:
+      * a request carrying a `failed` block — its dataLength/encodedDataLength
+        count the bytes of the locally generated error document (which can be
+        ~180 KB), not anything the server sent;
+      * anything served from a non-network scheme — the data: images the error
+        page inlines are logged with HTTP 200 responses.
+
+    As a second, more direct signal, a main-document request that failed
+    outright while no IP was contacted and no HTTP status was recorded is a
+    failed scan regardless of what else the request list contains."""
     result_lists = scan_result_data.get('lists') or {}
     page_info = scan_result_data.get('page') or {}
     network_data = scan_result_data.get('data') or {}
 
     contacted_ip = bool(result_lists.get('ips')) or bool(page_info.get('ip'))
     has_http_status = page_info.get('status') is not None
-    recorded_requests = network_data.get('requests') or []
-    got_response_bytes = any(
-        ((recorded_request.get('response') or {}).get('dataLength') or 0) > 0
-        or ((recorded_request.get('response') or {}).get('encodedDataLength') or 0) > 0
-        or (((recorded_request.get('response') or {}).get('response') or {})
-            .get('status') is not None)
-        for recorded_request in recorded_requests
-    )
-    return not (contacted_ip or has_http_status or got_response_bytes)
+
+    got_response_bytes = False
+    for recorded_request in network_data.get('requests') or []:
+        if not _is_network_request(recorded_request):
+            continue
+        response_block = recorded_request.get('response') or {}
+        if response_block.get('failed'):
+            continue
+        inner_response = response_block.get('response') or {}
+        if (inner_response.get('status') is not None
+                or (inner_response.get('encodedDataLength') or 0) > 0
+                or (response_block.get('dataLength') or 0) > 0
+                or (response_block.get('encodedDataLength') or 0) > 0):
+            got_response_bytes = True
+            break
+
+    if not (contacted_ip or has_http_status or got_response_bytes):
+        return True
+    return (bool(urlscan_primary_error(scan_result_data))
+            and not contacted_ip and not has_http_status)
 
 
 # --- AlienVault OTX -----------------------------------------------------------
@@ -934,6 +1060,8 @@ def build_url_record(url, urlscan_outcome, private_scan_note=None):
     scan_result_data = None
     urlscan_field, gsb_field, note, verdict = "n/a", None, None, "Unknown"
     report_url = screenshot_url = None
+    effective_url = redirect_scope = redirect_via = None
+    redirect_chain = []
     flagged_by, cleared_by = [], []
 
     if urlscan_outcome and urlscan_outcome["status"] == "submitted":
@@ -947,14 +1075,28 @@ def build_url_record(url, urlscan_outcome, private_scan_note=None):
 
     if scan_result_data is not None:
         screenshot_url = get_screenshot_url(scan_result_data)
+        # Submitted URL vs the URL actually landed on. Recorded for every scan
+        # (a failed one simply has no redirect, so effective_url stays None).
+        redirect_chain, hop_initiators = urlscan_redirect_chain(scan_result_data, url)
+        if len(redirect_chain) > 1:
+            effective_url = redirect_chain[-1]
+            submitted_apex = registrable_domain(extract_host(url))
+            effective_apex = registrable_domain(extract_host(effective_url))
+            redirect_scope = ("off-domain" if submitted_apex != effective_apex
+                              else "same-domain")
+            redirect_via = ", ".join(dict.fromkeys(hop_initiators)) or None
         if urlscan_scan_failed(scan_result_data):
             # urlscan returned a report, but the site itself was never loaded
             # (the "We could not scan this website!" page). overall.malicious is
             # false / score 0 only because there was no page to judge — so this
             # is UNKNOWN, never clean. Two-Source Verification (VT) then decides.
-            urlscan_field = "could not scan (site unreachable)"
-            note = ("urlscan could not load the site — DNS/network failure, "
-                    "weak TLS, or HTTP authentication required")
+            primary_error = urlscan_primary_error(scan_result_data)
+            urlscan_field = (f"could not scan ({primary_error})" if primary_error
+                             else "could not scan (site unreachable)")
+            note = ("urlscan could not load the site"
+                    + (f" — {primary_error}" if primary_error else "")
+                    + " (DNS/network failure, weak TLS, "
+                      "or HTTP authentication required)")
             verdict = "Unknown"
         else:
             verdicts_block = scan_result_data.get('verdicts') or {}
@@ -991,6 +1133,11 @@ def build_url_record(url, urlscan_outcome, private_scan_note=None):
             'urlscan_field': urlscan_field, 'gsb_field': gsb_field,
             'result_url': report_url, 'screenshot': screenshot_url,
             'note': note, 'private_scan': private_scan_note,
+            'effective_url': effective_url, 'redirect_chain': redirect_chain,
+            'redirect_scope': redirect_scope, 'redirect_via': redirect_via,
+            'offsite_redirect': redirect_scope == "off-domain",
+            'offsite_landing': False,
+            'discovered_from': None, 'force_two_source': False,
             'flagged_by': flagged_by, 'cleared_by': cleared_by}
 
 
@@ -1002,7 +1149,12 @@ def build_whitelisted_url_record(url, url_hostname, matched_whitelist_entry):
             'urlscan_field': f"Skipped (host matches {matched_whitelist_entry} in {SRC_WHITELIST})",
             'gsb_field': None, 'result_url': None, 'screenshot': None,
             'note': f"host {url_hostname} matches whitelist entry {matched_whitelist_entry}",
-            'private_scan': None, 'flagged_by': [], 'cleared_by': []}
+            'private_scan': None,
+            'effective_url': None, 'redirect_chain': [], 'redirect_scope': None,
+            'redirect_via': None, 'offsite_redirect': False,
+            'offsite_landing': False,
+            'discovered_from': None, 'force_two_source': False,
+            'flagged_by': [], 'cleared_by': []}
 
 
 def build_domain_record(domain, otx_api_headers):
@@ -1038,11 +1190,23 @@ def build_ip_record(ip_address_text, abuse_api_headers, is_sender=False):
 # --- Per-section line formatters ----------------------------------------------
 
 def format_url_line(record):
-    line_fields = [f"URLScan: {record['urlscan_field']}"]
+    line_fields = []
+    if record.get('discovered_from'):
+        line_fields.append(f"↩️ Effective URL of {defang(record['discovered_from'])}")
+    line_fields.append(f"URLScan: {record['urlscan_field']}")
     if record.get('private_scan'):
         line_fields.append(f"🔒 Private scan ({record['private_scan']})")
     if record.get('gsb_field') is not None:
         line_fields.append(f"GSB: {record['gsb_field']}")
+    if record.get('effective_url'):
+        redirect_detail = record.get('redirect_scope') or "redirect"
+        if record.get('redirect_via'):
+            redirect_detail += f", via {record['redirect_via']}"
+        hop_count = max(len(record.get('redirect_chain') or []) - 1, 1)
+        if hop_count > 1:
+            redirect_detail += f", {hop_count} hops"
+        line_fields.append(f"↪️ Effective URL: {defang(record['effective_url'])} "
+                           f"({redirect_detail})")
     if record.get('result_url'):
         line_fields.append(f"[Report]({record['result_url']})")
     if record.get('screenshot'):
@@ -1281,7 +1445,12 @@ def two_source_verdict(first_verdict, vt_result, kind):
         not actually scan the item, so a clean VT alone is not enough to clear
         it — e.g. a URL urlscan could not reach).
       * First factor was Unknown and VT has no record   -> Unknown (no data at
-        all; never Clean)."""
+        all; never Clean).
+      * First factor was Clean and VT agrees / has no record -> Clean. Only
+        items that were forced through verification (redirect targets, see
+        FORCE_TWO_SOURCE_ON_DISCOVERED) reach this branch with a clean first
+        factor: the page really was loaded and cleared, so a silent VT is not
+        a reason to doubt it."""
     vt_record_absent = vt_result.get('absent')
     vt_verdict = None if vt_record_absent else vt_result.get('verdict')
 
@@ -1289,6 +1458,8 @@ def two_source_verdict(first_verdict, vt_result, kind):
         return 'Suspicious' if kind == 'ip' else 'Malicious'
     if vt_verdict == 'Suspicious' or first_verdict == 'Suspicious':
         return 'NeedsReview'
+    if first_verdict == 'Clean':
+        return 'Clean'
     # Only an Unknown first factor reaches this point.
     if vt_verdict == 'Clean':
         return 'NeedsReview'
@@ -1348,6 +1519,17 @@ def build_watchlist_reason(record):
             vendor_summary = f"{vt_result.get('malicious', 0)}/{vt_result.get('total', 0)} malicious"
             reason_parts.append(f"{SRC_VT}: {str(vt_result.get('verdict', '')).lower()} ({vendor_summary})")
 
+    # Redirect context: where this URL sent the browser, or which URL it was
+    # discovered from.
+    if record.get('effective_url'):
+        reason_parts.append(f"{SRC_URLSCAN}: redirects "
+                            f"({record.get('redirect_scope') or 'redirect'}) to "
+                            f"{defang(record['effective_url'])}")
+    if record.get('discovered_from'):
+        landing_scope = "off-domain " if record.get('offsite_landing') else ""
+        reason_parts.append(f"{SRC_URLSCAN}: {landing_scope}effective URL of "
+                            f"{defang(record['discovered_from'])}")
+
     # For URLs, surface the OTX standing of the parent domain for extra context,
     # so a reader doesn't have to cross-reference the Domains section.
     if record.get('kind') == 'url' and record.get('domain_otx'):
@@ -1375,7 +1557,9 @@ def watchlist_verdict(record):
     combined_verdict = record.get('combined_verdict')
     if combined_verdict in ('Malicious', 'Suspicious', 'Unknown', 'NeedsReview'):
         return combined_verdict
-    if record.get('recent') and record['verdict'] == 'Clean':
+    if record['verdict'] == 'Clean' and (record.get('recent')
+                                         or record.get('offsite_redirect')
+                                         or record.get('offsite_landing')):
         return 'NeedsReview'
     return record['verdict']
 
@@ -1391,6 +1575,11 @@ def needs_watchlist(record):
     if record.get('combined_verdict') in ('Suspicious', 'Malicious', 'Unknown', 'NeedsReview'):
         return True
     if record.get('recent'):
+        return True
+    # A URL that quietly hands the browser to a different registrable domain is
+    # worth an analyst's eyes even when every scanner came back clean — and so
+    # is the landing page on the other side of that redirect.
+    if record.get('offsite_redirect') or record.get('offsite_landing'):
         return True
     return False
 
@@ -1642,6 +1831,86 @@ def build_indicators_block(parsed_headers):
     return indicator_lines
 
 
+# --- URL scanning batches (used once for the email's URLs, then once per
+# --- round of effective-URL discovery) -----------------------------------------
+
+def submit_url_batch(urls_to_scan, api_headers, recipient_tokens,
+                     exact_whitelist_hosts, wildcard_whitelist_suffixes,
+                     throttle_first=False):
+    """Submit a batch of URLs to URLScan.io. Order of checks per URL:
+    (1) whitelist skip, (2) private-scan escalation (keyword / recipient
+    identifier -> "private" visibility), (3) submission. `throttle_first` waits
+    before the first submission too, which is what a follow-up round wants."""
+    pending_submissions = {}
+    needs_throttle = throttle_first
+    for url_observable in urls_to_scan:
+        if match_whitelist(extract_host(url_observable), exact_whitelist_hosts,
+                           wildcard_whitelist_suffixes):
+            continue
+        escalation_reason = private_scan_reason(url_observable, recipient_tokens)
+        scan_visibility = "private" if escalation_reason else "unlisted"
+        if needs_throttle:                       # throttle BETWEEN submissions only —
+            time.sleep(URLSCAN_SUBMIT_THROTTLE)  # no wasted sleep after the last one
+        needs_throttle = True
+        pending_submissions[url_observable] = {
+            'outcome': submit_scan(url_observable, api_headers,
+                                   visibility=scan_visibility),
+            'private_reason': escalation_reason,
+        }
+    return pending_submissions
+
+
+def build_url_record_batch(urls_to_scan, pending_submissions,
+                           exact_whitelist_hosts, wildcard_whitelist_suffixes,
+                           discovered_from=None):
+    """Poll and turn a submitted batch into records. `discovered_from` maps a
+    URL to the URL that redirected to it; those records are marked so they can
+    be labelled in the report and forced through Two-Source Verification."""
+    url_records = []
+    for url_observable in urls_to_scan:
+        url_hostname = extract_host(url_observable)
+        matched_whitelist_entry = match_whitelist(url_hostname, exact_whitelist_hosts,
+                                                  wildcard_whitelist_suffixes)
+        if matched_whitelist_entry:
+            url_record = build_whitelisted_url_record(url_observable, url_hostname,
+                                                      matched_whitelist_entry)
+        else:
+            pending_submission = pending_submissions.get(url_observable) or {}
+            url_record = build_url_record(
+                url_observable, pending_submission.get('outcome'),
+                private_scan_note=pending_submission.get('private_reason'))
+        if discovered_from:
+            parent_info = discovered_from.get(url_observable) or {}
+            url_record['discovered_from'] = parent_info.get('parent')
+            url_record['offsite_landing'] = parent_info.get('scope') == "off-domain"
+            url_record['force_two_source'] = (FORCE_TWO_SOURCE_ON_DISCOVERED
+                                              and url_record['verdict'] != 'WhitelistSkip')
+        url_records.append(url_record)
+    return url_records
+
+
+def next_effective_urls(source_records, already_seen_urls, remaining_budget):
+    """Effective URLs worth scanning in their own right, taken from a batch of
+    freshly built records: the landing page differs from what was submitted,
+    nothing has scanned it yet, and it is a sane target. Returns
+    (urls, discovered_from) — the second mapping each new URL to its parent."""
+    discovered_urls, discovered_from = [], {}
+    if not FOLLOW_EFFECTIVE_URLS or remaining_budget <= 0:
+        return discovered_urls, discovered_from
+    for source_record in source_records:
+        effective_url = source_record.get('effective_url')
+        if not effective_url or len(discovered_urls) >= remaining_budget:
+            continue
+        canonical_key = _canonical_url(effective_url)
+        if canonical_key in already_seen_urls or not is_scannable(effective_url):
+            continue
+        already_seen_urls.add(canonical_key)
+        discovered_urls.append(effective_url)
+        discovered_from[effective_url] = {'parent': source_record['observable'],
+                                          'scope': source_record.get('redirect_scope')}
+    return discovered_urls, discovered_from
+
+
 # --- The main pipeline --------------------------------------------------------
 
 def run_osint(parsed_headers, url_observables, domain_observables, raw_message_bytes):
@@ -1670,41 +1939,37 @@ def run_osint(parsed_headers, url_observables, domain_observables, raw_message_b
         print("*No domains found.*")
 
     # --- URLs: URLScan.io is the sole first-factor verdict source ---
-    # Order of checks per URL: (1) whitelist skip, (2) private-scan escalation
-    # (keyword / recipient identifier -> "private" visibility), (3) submission.
     recipient_tokens = collect_recipient_tokens(parsed_headers)
-    pending_submissions = {}
-    is_first_submission = True
-    for url_observable in url_observables:
-        matched_whitelist_entry = match_whitelist(extract_host(url_observable),
-                                                  exact_whitelist_hosts,
-                                                  wildcard_whitelist_suffixes)
-        if matched_whitelist_entry:
-            continue
-        escalation_reason = private_scan_reason(url_observable, recipient_tokens)
-        scan_visibility = "private" if escalation_reason else "unlisted"
-        if not is_first_submission:          # throttle BETWEEN submissions only —
-            time.sleep(URLSCAN_SUBMIT_THROTTLE)  # no wasted sleep after the last one
-        is_first_submission = False
-        pending_submissions[url_observable] = {
-            'outcome': submit_scan(url_observable, urlscan_api_headers,
-                                   visibility=scan_visibility),
-            'private_reason': escalation_reason,
-        }
+    pending_submissions = submit_url_batch(url_observables, urlscan_api_headers,
+                                           recipient_tokens, exact_whitelist_hosts,
+                                           wildcard_whitelist_suffixes)
+    url_records = build_url_record_batch(url_observables, pending_submissions,
+                                         exact_whitelist_hosts,
+                                         wildcard_whitelist_suffixes)
 
-    url_records = []
-    for url_observable in url_observables:
-        url_hostname = extract_host(url_observable)
-        matched_whitelist_entry = match_whitelist(url_hostname, exact_whitelist_hosts,
-                                                  wildcard_whitelist_suffixes)
-        if matched_whitelist_entry:
-            url_records.append(build_whitelisted_url_record(url_observable, url_hostname,
-                                                            matched_whitelist_entry))
-        else:
-            pending_submission = pending_submissions.get(url_observable) or {}
-            url_records.append(build_url_record(url_observable,
-                                                pending_submission.get('outcome'),
-                                                private_scan_note=pending_submission.get('private_reason')))
+    # --- Effective-URL discovery: a URL that redirects has a landing page no
+    # source has looked at yet, so scan that landing page as its own observable
+    # (URLScan.io now, VirusTotal forced later, OTX for a new apex domain).
+    seen_url_keys = {_canonical_url(url_observable) for url_observable in url_observables}
+    discovery_budget = DISCOVERY_MAX_URLS
+    frontier_records = url_records
+    discovered_url_records = []
+    for _discovery_round in range(DISCOVERY_MAX_ROUNDS):
+        discovered_urls, discovered_from = next_effective_urls(
+            frontier_records, seen_url_keys, discovery_budget)
+        if not discovered_urls:
+            break
+        discovery_budget -= len(discovered_urls)
+        discovered_pending = submit_url_batch(discovered_urls, urlscan_api_headers,
+                                              recipient_tokens, exact_whitelist_hosts,
+                                              wildcard_whitelist_suffixes,
+                                              throttle_first=True)
+        frontier_records = build_url_record_batch(discovered_urls, discovered_pending,
+                                                  exact_whitelist_hosts,
+                                                  wildcard_whitelist_suffixes,
+                                                  discovered_from=discovered_from)
+        discovered_url_records.extend(frontier_records)
+    url_records.extend(discovered_url_records)
 
     print("---")
     print("### URLs")
@@ -1714,6 +1979,26 @@ def run_osint(parsed_headers, url_observables, domain_observables, raw_message_b
             print(format_url_line(url_record))
     else:
         print("*No URLs found.*")
+
+    # --- Domains reached only through a redirect: an off-domain landing page
+    # introduces an apex domain the email never mentioned, so give it the same
+    # OTX/RDAP treatment as any other domain instead of leaving it unexamined.
+    known_apex_domains = {domain_record['observable'] for domain_record in domain_records}
+    redirect_domain_records = []
+    for discovered_record in discovered_url_records:
+        apex_domain = registrable_domain(extract_host(discovered_record['observable']))
+        if (apex_domain and apex_domain not in known_apex_domains
+                and is_scannable(apex_domain)):
+            known_apex_domains.add(apex_domain)
+            redirect_domain_records.append(build_domain_record(apex_domain,
+                                                               otx_api_headers))
+    if redirect_domain_records:
+        print("---")
+        print("### Domains (via redirects)")
+        print("---")
+        for redirect_domain_record in _sort_records(redirect_domain_records):
+            print(format_domain_line(redirect_domain_record))
+        domain_records.extend(redirect_domain_records)
 
     # --- IPs: AbuseIPDB is the sole first-factor verdict source ---
     print("---")
@@ -1735,8 +2020,12 @@ def run_osint(parsed_headers, url_observables, domain_observables, raw_message_b
     print("### Two-Source Verification")
     print("---")
 
+    # Non-clean first-factor items always qualify; redirect targets are pushed
+    # through even when URLScan.io cleared them (force_two_source), because a
+    # landing page nobody expected deserves a second opinion.
     verification_candidates = [record for record in (domain_records + url_records + ip_records)
-                               if record['verdict'] in ('Malicious', 'Suspicious', 'Unknown')]
+                               if record['verdict'] in ('Malicious', 'Suspicious', 'Unknown')
+                               or record.get('force_two_source')]
     _severity_rank = {'Malicious': 0, 'Suspicious': 1, 'Unknown': 2}
     verification_candidates.sort(key=lambda record: (_severity_rank.get(record['verdict'], 3),
                                                      record['observable'].lower()))
