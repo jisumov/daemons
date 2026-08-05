@@ -5,15 +5,17 @@ import sys
 import re
 import os
 import time
+import socket
 import quopri
 import base64
 import hashlib
 import functools
 import ipaddress
+import unicodedata
 import requests
 import tldextract
 import urllib3
-from urllib.parse import urlparse, urlunparse, quote, unquote, parse_qs
+from urllib.parse import urlparse, urlunparse, urljoin, quote, unquote, parse_qs
 from email.parser import HeaderParser
 from email.header import decode_header
 from email.utils import parsedate_to_datetime, parseaddr, getaddresses
@@ -22,7 +24,11 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+# --- TLS verification switch --------------------------------------------------
+VERIFY_TLS = True
+
+if not VERIFY_TLS:
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # --- Config -------------------------------------------------------------------
 
@@ -44,16 +50,14 @@ VT_STALE_MAX_AGE_DAYS = 365
 
 DEEPDIVE_MAX_AGE_DAYS = 365
 
+MAX_INPUT_BYTES = 2_000_000
+
+RDAP_MAX_HOPS = 5
+
 # --- Effective-URL discovery ---------------------------------------------------
-# urlscan reports both the URL we submitted (task.url) and the URL the browser
-# actually ended up on (page.url) — the "Effective URL" on the report page. When
-# they differ, the landing page is a DIFFERENT observable that nothing has
-# looked at yet, so it is scanned in its own right: URLScan.io first, then
-# VirusTotal as the second source (forced, see FORCE_TWO_SOURCE_ON_DISCOVERED),
-# and its apex domain goes to OTX if it is new.
 FOLLOW_EFFECTIVE_URLS = True
-DISCOVERY_MAX_URLS = 5        # hard cap on redirect targets pulled in per run
-DISCOVERY_MAX_ROUNDS = 2      # a target that itself redirects is followed again
+DISCOVERY_MAX_URLS = 5
+DISCOVERY_MAX_ROUNDS = 2
 FORCE_TWO_SOURCE_ON_DISCOVERED = True
 
 _SKIPPED_ATTACHMENT_MAINTYPES = ('image', 'video', 'audio')
@@ -65,14 +69,10 @@ _ALLOWED_API_HOSTS = (
     'www.virustotal.com', 'api.abuseipdb.com',
 )
 
+_REQUIRED_ENV = ('URLSCAN_DAEMON', 'ALIENVAULT_DAEMON',
+                 'VIRUSTOTAL_DAEMON', 'ABUSEIPDB_DAEMON')
+
 # --- Analyst-maintained whitelist (URL skip-list) -----------------------------
-# Two kinds of entries, chosen PER ENTRY:
-#   "microsoft.com"     exact    -> skips ONLY the host microsoft.com itself;
-#                                   random.microsoft.com / careers.microsoft.com
-#                                   ARE still scanned.
-#   "*.instagram.com"   wildcard -> skips instagram.com AND every subdomain
-#                                   (www.instagram.com, account.instagram.com, ...).
-# The wildcard is opt-in per entry: no '*.' prefix means exact matching.
 WHITELISTED_DOMAINS = {
     "outlook.com",
     "microsoft.com",
@@ -81,14 +81,6 @@ WHITELISTED_DOMAINS = {
 }
 
 # --- Private-scan escalation (URLScan.io visibility) ---------------------------
-# Runs AFTER the whitelist skip: a URL that will actually be scanned is
-# escalated from "unlisted" to "private" visibility when (a) it contains one of
-# the analyst-maintained keywords below, or (b) it embeds a recipient
-# identifier (full address, local-part, or a local-part fragment of at least
-# PRIVATE_SCAN_MIN_TOKEN_LENGTH characters) taken from To / Cc / Delivered-To.
-# Such URLs tend to carry PII or single-use tokens that must never surface in
-# other users' URLScan search results. NOTE: private scans consume the private
-# quota of the URLScan account tied to URLSCAN_DAEMON.
 PRIVATE_SCAN_KEYWORDS = {
     "unsub", "token", "login", "signin", "password", "reset",
     "verify", "invoice", "otp", "sso",
@@ -101,14 +93,9 @@ OTX_SUSPICIOUS_PULSES = 1
 ABUSE_SUSPICIOUS = 25
 ABUSE_MALICIOUS = 75
 
-# Titles of the two watchlist blocks: the machine-built preview (observable +
-# verdict + full reasoning) and the analyst-owned review copy underneath it
-# (observable + verdict only, meant to be re-verdicted by hand after manually
-# checking each artifact).
 WATCHLIST_PREVIEW_TITLE = "Watchlist Preview"
 WATCHLIST_REVIEW_TITLE = "Watchlist Review"
 
-# Display label for every verdict — single source of truth for the tags.
 _LABELS = {
     "Clean": "CLEAN ✅",
     "Suspicious": "SUSPICIOUS ⚠️",
@@ -135,12 +122,10 @@ SRC_WHITELIST = "Analyst Whitelist"
 
 _DEFANG_HTTP_RE = re.compile(r'(?i)http')
 _DEFANG_IPV4_RE = re.compile(r'\b(?:\d{1,3}\.){3}\d{1,3}\b')
-# Defang dots, but NEVER a dot inside an email local-part (the part before the
-# @), so name.surname@email.com -> name.surname@email[.]com (only the domain is
-# defanged). The (?![local]*@) lookahead skips any dot that is followed by
-# local-part characters and then an @.
 _DEFANG_DOT_RE = re.compile(
     r'(?<!\bheader)(?<!\bsmtp)(?<!\bcompauth)\.(?![a-zA-Z0-9._%+-]*@)(?=[a-zA-Z]{2,}\b)')
+
+_TERMINAL_CTRL_RE = re.compile(r'[\x00-\x08\x0b-\x1f\x7f-\x9f]')
 
 _AUTH_PROTO_RE = re.compile(r'^(spf|dkim|dmarc|compauth|arc)=([a-zA-Z0-9]+)', re.IGNORECASE)
 _COMPAUTH_REASON_RE = re.compile(r'reason=(\d+)')
@@ -167,18 +152,71 @@ _DOMAIN_IN_TEXT_RE = re.compile(r'\b(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}\b')
 _LOCAL_PART_SEPARATOR_RE = re.compile(r'[._+\-]')
 
 
+# --- Unicode sanitisation (evasion defence) -----------------------------------
+
+def strip_terminal_controls(text):
+    return _TERMINAL_CTRL_RE.sub('', text) if text else text
+
+
+def strip_invisibles(text):
+    return ''.join(ch for ch in text if unicodedata.category(ch) != 'Cf') if text else text
+
+
+def invisible_char_names(text):
+    return sorted({unicodedata.name(ch, f"U+{ord(ch):04X}")
+                   for ch in (text or '') if unicodedata.category(ch) == 'Cf'})
+
+
 # --- Safe transport -----------------------------------------------------------
 
 def _safe_request(method, url, **kwargs):
-    """Single choke point for ALL outbound traffic. Refuses non-API hosts so the
-    tool can never be tricked into fetching a target URL directly."""
     request_hostname = (urlparse(url).hostname or '').lower()
     if not any(request_hostname == allowed_api_host
                or request_hostname.endswith('.' + allowed_api_host)
                for allowed_api_host in _ALLOWED_API_HOSTS):
         raise ValueError(f"Blocked request to non-API host: {url}")
     kwargs.setdefault('timeout', HTTP_TIMEOUT)
+    kwargs.setdefault('verify', VERIFY_TLS)
+    kwargs.setdefault('allow_redirects', False)
     return requests.request(method, url, **kwargs)
+
+
+def _host_is_public(hostname):
+    if not hostname:
+        return False
+    try:
+        address_infos = socket.getaddrinfo(hostname, None)
+    except (socket.gaierror, UnicodeError):
+        return False
+    for address_info in address_infos:
+        resolved_ip = address_info[4][0].split('%')[0]
+        try:
+            ip_object = ipaddress.ip_address(resolved_ip)
+        except ValueError:
+            return False
+        if (ip_object.is_private or ip_object.is_loopback or ip_object.is_reserved
+                or ip_object.is_link_local or ip_object.is_multicast
+                or ip_object.is_unspecified):
+            return False
+    return True
+
+
+def _rdap_get(url):
+    for _hop in range(RDAP_MAX_HOPS):
+        parsed_url = urlparse(url)
+        if parsed_url.scheme != 'https' or not _host_is_public(parsed_url.hostname):
+            return None
+        rdap_response = requests.get(
+            url, headers={'Accept': 'application/rdap+json'},
+            timeout=HTTP_TIMEOUT, verify=VERIFY_TLS, allow_redirects=False)
+        if rdap_response.status_code in (301, 302, 303, 307, 308):
+            location = rdap_response.headers.get('Location')
+            if not location:
+                return None
+            url = urljoin(url, location)
+            continue
+        return rdap_response
+    return None
 
 
 # --- Formatting helpers -------------------------------------------------------
@@ -186,6 +224,7 @@ def _safe_request(method, url, **kwargs):
 def defang(text):
     if not text or text == "Not Found":
         return text
+    text = strip_terminal_controls(text)
     text = _DEFANG_HTTP_RE.sub('hxxp', text)
     text = _DEFANG_IPV4_RE.sub(lambda ipv4_match: ipv4_match.group(0).replace('.', '[.]'),
                                text)
@@ -226,11 +265,10 @@ def get_status_emoji(status_text):
         'pass': f"{status_text} ✅", 'fail': f"{status_text} ❌", 'softfail': f"{status_text} ⚠️",
         'temperror': f"{status_text} 🛠️", 'permerror': f"{status_text} 🛠️",
         'none': f"{status_text} ❔", 'neutral': f"{status_text} ❔",
-        # Heuristic / partial / ambiguous outcomes worth a human glance.
-        'bestguesspass': f"{status_text} 👀",   # dmarc: no published record, MS "best guess" passed
-        'softpass': f"{status_text} 👀",        # compauth: weak/partial composite pass
-        'unknown': f"{status_text} ❔",          # compauth: could not be determined
-        'policy': f"{status_text} ⚠️",          # dkim: signature valid but rejected by local policy
+        'bestguesspass': f"{status_text} 👀",
+        'softpass': f"{status_text} 👀",
+        'unknown': f"{status_text} ❔",
+        'policy': f"{status_text} ⚠️",
         'error': f"{status_text} 🛠️",
     }.get(status_text, f"{status_text} 👀" if status_text else "unknown ❔")
 
@@ -269,8 +307,6 @@ def verdict_label(verdict):
 
 
 def _sort_records(records, verdict_key='verdict'):
-    """Group by verdict (CLEAN, SUSPICIOUS, MALICIOUS, UNKNOWN, NEEDS REVIEW,
-    then anything else), alphabetical within. One tuple sort, both layers."""
     return sorted(records,
                   key=lambda record: (_VERDICT_ORDER.get(record.get(verdict_key), 99),
                                       record['observable'].lower()))
@@ -290,14 +326,6 @@ def extract_host(observable):
 
 
 def unwrap_safelink(url):
-    """Outlook SafeLinks hide the real destination inside the urlencoded `url=`
-    query parameter of a *.safelinks.protection.outlook.com redirector. Because
-    outlook.com is whitelisted, the wrapper would be skipped and the real
-    target never scanned. Return that decoded target so it can be scanned (and
-    its domain reach OTX) instead, or None if `url` isn't a SafeLink.
-
-    parse_qs already URL-decodes the value once, which is the correct (single)
-    level of decoding for a standard SafeLink — no second unquote needed."""
     try:
         parsed_url = urlparse(url)
     except ValueError:
@@ -343,16 +371,6 @@ def registrable_domain(hostname):
 
 
 def _build_whitelist(whitelist_entries):
-    """Normalise the analyst whitelist (WHITELISTED_DOMAINS) into two sets of
-    lower-cased hostnames: (exact_hosts, wildcard_suffixes).
-
-    * Plain entry    'microsoft.com'    -> EXACT match only: skips the host
-      microsoft.com, NOT careers.microsoft.com nor random.microsoft.com.
-    * Wildcard entry '*.instagram.com'  -> matches instagram.com itself AND
-      every subdomain (www.instagram.com, account.instagram.com, ...).
-
-    Accepts bare hosts or full URLs; the '*.' prefix, scheme, path, port and
-    trailing dot are stripped. Invalid entries are silently dropped."""
     exact_hosts, wildcard_suffixes = set(), set()
     for whitelist_entry in whitelist_entries:
         if not whitelist_entry:
@@ -370,8 +388,6 @@ def _build_whitelist(whitelist_entries):
 
 
 def match_whitelist(hostname, exact_hosts, wildcard_suffixes):
-    """The whitelist entry that covers `hostname` ('microsoft.com' for an exact
-    hit, '*.instagram.com' for a wildcard hit), or None when nothing does."""
     if not hostname:
         return None
     if hostname in exact_hosts:
@@ -385,11 +401,6 @@ def match_whitelist(hostname, exact_hosts, wildcard_suffixes):
 # --- Private-scan escalation (runs AFTER the whitelist skip) --------------------
 
 def collect_recipient_tokens(parsed_headers):
-    """Lower-cased identifiers of every recipient (To / Cc / Delivered-To /
-    X-Original-To): the full address, the local-part, the local-part with its
-    separators removed, and every separator-delimited fragment of the
-    local-part with at least PRIVATE_SCAN_MIN_TOKEN_LENGTH characters (shorter
-    fragments like 'jo' would match half the internet)."""
     recipient_tokens = set()
     raw_recipient_headers = []
     for recipient_header_name in ('To', 'Cc', 'Delivered-To', 'X-Original-To'):
@@ -409,12 +420,6 @@ def collect_recipient_tokens(parsed_headers):
 
 
 def private_scan_reason(url, recipient_tokens):
-    """Reason string when `url` must be scanned with PRIVATE visibility (it
-    contains a PRIVATE_SCAN_KEYWORDS entry or an embedded recipient
-    identifier), else None. Both the raw and the percent-decoded form of the
-    URL are checked, case-insensitively. Keywords are checked in sorted order
-    and recipient tokens longest-first, so the reported reason is
-    deterministic and as specific as possible."""
     lowered_url_forms = {url.lower()}
     try:
         lowered_url_forms.add(unquote(url).lower())
@@ -503,10 +508,8 @@ def rdap_creation_date(apex_domain):
         return _RDAP_CACHE[apex_domain]
     creation_date_iso = None
     try:
-        rdap_response = _safe_request('GET', f'https://rdap.org/domain/{quote(apex_domain)}',
-                                      headers={'Accept': 'application/rdap+json'},
-                                      allow_redirects=True, verify=False)
-        if rdap_response.status_code == 200:
+        rdap_response = _rdap_get(f'https://rdap.org/domain/{quote(apex_domain)}')
+        if rdap_response is not None and rdap_response.status_code == 200:
             creation_date_iso = _search_creation_date(rdap_response.json())
     except (requests.RequestException, ValueError):
         creation_date_iso = None
@@ -516,10 +519,6 @@ def rdap_creation_date(apex_domain):
 
 # --- URLScan.io ---------------------------------------------------------------
 
-# Schemes that never represent traffic to the target site. When a navigation
-# fails, Chrome renders its own error page from chrome-error://chromewebdata/
-# and inlines its artwork as data: URIs — those requests report HTTP 200 and a
-# non-zero dataLength, which must NOT be read as "the site answered".
 _NON_NETWORK_SCHEMES = ('data:', 'blob:', 'about:', 'chrome:', 'chrome-error:',
                         'chrome-extension:', 'javascript:', 'filesystem:')
 
@@ -529,14 +528,10 @@ def _urlscan_headers():
 
 
 def submit_scan(observable, api_headers, visibility="unlisted"):
-    """Submit `observable` to URLScan.io. `visibility` is "unlisted" by default
-    and "private" when the private-scan escalation matched (keyword or
-    recipient identifier embedded in the URL)."""
     try:
         submit_response = _safe_request('POST', 'https://urlscan.io/api/v1/scan/',
                                         headers=api_headers,
-                                        json={"url": observable, "visibility": visibility},
-                                        verify=False)
+                                        json={"url": observable, "visibility": visibility})
     except (requests.RequestException, ValueError):
         return {"status": "error", "message": "submit error ❌"}
     if submit_response.status_code == 200:
@@ -554,18 +549,12 @@ def poll_result(result_api_url, api_headers):
     polling_deadline = time.time() + URLSCAN_MAX_WAIT
     while time.time() < polling_deadline:
         try:
-            poll_response = _safe_request('GET', result_api_url, headers=api_headers,
-                                          verify=False)
+            poll_response = _safe_request('GET', result_api_url, headers=api_headers)
         except (requests.RequestException, ValueError):
-            # Transient network blip — keep waiting, don't abandon the scan.
             time.sleep(URLSCAN_POLL_INTERVAL)
             continue
         if poll_response.status_code == 200:
             return poll_response.json(), None
-        # 404 = result not ready yet; 429/5xx = transient while urlscan is still
-        # assembling the result. Keep polling until the deadline instead of
-        # bailing out on the first non-200 (a mid-scan 500 must NOT be reported
-        # as a final verdict).
         if (poll_response.status_code == 404 or poll_response.status_code == 429
                 or poll_response.status_code >= 500):
             time.sleep(URLSCAN_POLL_INTERVAL)
@@ -594,10 +583,6 @@ def get_screenshot_url(scan_result_data):
 
 
 def _canonical_url(url):
-    """Loose canonical form used only to compare/deduplicate URLs: lower-cased
-    scheme and host, '/' for an empty path, no trailing slash beyond the root,
-    fragment dropped. So 'https://Example.com' , 'https://example.com/' and
-    'https://example.com/#top' all collapse to the same key."""
     try:
         parsed_url = urlparse((url or '').strip())
     except ValueError:
@@ -612,20 +597,11 @@ def _canonical_url(url):
 
 
 def urlscan_effective_url(scan_result_data):
-    """The URL the browser actually ended up on (`page.url` — urlscan's
-    "Effective URL"), or None when the report doesn't carry a usable one."""
     page_url = ((scan_result_data.get('page') or {}).get('url') or '').strip()
     return page_url if page_url.lower().startswith(('http://', 'https://')) else None
 
 
 def urlscan_redirect_chain(scan_result_data, submitted_url):
-    """(hops, initiators) for the navigation that produced this report.
-
-    `hops` starts at the submitted URL and ends at the effective URL, so a
-    single-element list means nothing redirected. Hops come from
-    `data.redirects` (which also names what caused each one — 'script' for a
-    JS/meta redirect, otherwise an HTTP 3xx), and `page.url` is appended in
-    case urlscan recorded the landing page without a redirect entry."""
     navigation_hops = [submitted_url]
     hop_initiators = []
     for redirect_entry in (scan_result_data.get('data') or {}).get('redirects') or []:
@@ -642,9 +618,6 @@ def urlscan_redirect_chain(scan_result_data, submitted_url):
 
 
 def _is_network_request(recorded_request):
-    """True only for real http(s) traffic. Chrome's own error page
-    (chrome-error://chromewebdata/) and the data: images it inlines are NOT
-    evidence that the target site responded."""
     request_block = recorded_request.get('request') or {}
     request_url = ((request_block.get('request') or {}).get('url') or '').strip().lower()
     document_url = (request_block.get('documentURL') or '').strip().lower()
@@ -654,11 +627,6 @@ def _is_network_request(recorded_request):
 
 
 def urlscan_primary_error(scan_result_data):
-    """errorText of the failed main-document request ('net::ERR_NAME_NOT_RESOLVED',
-    'net::ERR_CONNECTION_REFUSED', ...), or None when the main document didn't
-    fail. Canceled requests are ignored on purpose: the ERR_ABORTED urlscan logs
-    while tearing the tab down is a consequence of the real failure, not its
-    cause, and reporting it would hide the useful error."""
     page_url = ((scan_result_data.get('page') or {}).get('url')
                 or (scan_result_data.get('task') or {}).get('url') or '').strip().lower()
     fallback_error = None
@@ -677,28 +645,6 @@ def urlscan_primary_error(scan_result_data):
 
 
 def urlscan_scan_failed(scan_result_data):
-    """True when urlscan returned a *completed* report but never actually loaded
-    the target site — the 'We could not scan this website!' case (DNS/network
-    failure, weak TLS, HTTP authentication required, ...).
-
-    In that situation `verdicts.overall` reads malicious=false / score=0 simply
-    because there was no page to judge, so reporting CLEAN would be wrong. We
-    only conclude failure when NOTHING was retrieved: no server IP was
-    contacted, no HTTP status was recorded, and no request returned any bytes.
-    (Requiring all three avoids false positives from a page that loaded fine but
-    pulled one resource from a sub-domain that failed.)
-
-    Two categories of request are excluded from the byte check, because both
-    describe Chrome's error page rather than the target:
-      * a request carrying a `failed` block — its dataLength/encodedDataLength
-        count the bytes of the locally generated error document (which can be
-        ~180 KB), not anything the server sent;
-      * anything served from a non-network scheme — the data: images the error
-        page inlines are logged with HTTP 200 responses.
-
-    As a second, more direct signal, a main-document request that failed
-    outright while no IP was contacted and no HTTP status was recorded is a
-    failed scan regardless of what else the request list contains."""
     result_lists = scan_result_data.get('lists') or {}
     page_info = scan_result_data.get('page') or {}
     network_data = scan_result_data.get('data') or {}
@@ -742,12 +688,6 @@ def _otx_link(indicator_type, indicator_value):
 
 
 def otx_lookup(observable, api_headers):
-    """Conservative OTX verdict: whitelisted -> Clean, pulses>=threshold ->
-    Suspicious, otherwise Clean. Pulse membership alone is never Malicious.
-
-    NOTE: the OTX `whitelisted` flag is recorded and surfaced on the domain line
-    for context, but it does not drive the URL skip-list — that is handled by
-    the analyst-maintained WHITELISTED_DOMAINS set in run_osint()."""
     hostname = extract_host(observable)
     if not hostname:
         return {"verdict": "Unknown", "pulses": None, "whitelisted": False, "link": None}
@@ -765,8 +705,7 @@ def otx_lookup(observable, api_headers):
     try:
         general_endpoint_url = (f"https://otx.alienvault.com/api/v1/indicators/"
                                 f"{indicator_type}/{quote(indicator_value)}/general")
-        otx_response = _safe_request('GET', general_endpoint_url, headers=api_headers,
-                                     verify=False)
+        otx_response = _safe_request('GET', general_endpoint_url, headers=api_headers)
         if otx_response.status_code == 200:
             response_data = otx_response.json()
             pulse_count = (response_data.get('pulse_info') or {}).get('count')
@@ -791,11 +730,6 @@ def _vt_headers():
 
 
 def _vt_normalize_url(url):
-    """Mirror VirusTotal's URL canonicalization closely enough that the base64
-    id we compute matches the object VT actually stored. The big gotcha is the
-    trailing slash: VT keeps 'https://googleabc.com' under the id for
-    'https://googleabc.com/', so a literal base64 of the bare form 404s even
-    though the report exists. We also lower-case the scheme and host."""
     try:
         parsed_url = urlparse(url)
     except ValueError:
@@ -812,8 +746,6 @@ def _vt_url_id(url):
 
 
 def _vt_url_endpoints(observable):
-    """Candidate (api, gui) pairs for a URL — VT-normalized form first, raw form
-    as a fallback (deduped)."""
     endpoint_pairs, seen_url_ids = [], set()
     for candidate_url in (_vt_normalize_url(observable), observable):
         url_id = _vt_url_id(candidate_url)
@@ -826,7 +758,6 @@ def _vt_url_endpoints(observable):
 
 
 def _vt_object_endpoint(observable):
-    """Return (api_url, gui_url, kind) for a URL / IP / domain."""
     hostname = extract_host(observable)
     if observable.startswith(('http://', 'https://')):
         api_url, gui_url = _vt_url_endpoints(observable)[0]
@@ -854,13 +785,12 @@ def _vt_verdict_from_stats(analysis_stats):
 
 
 def _poll_vt_analysis(analysis_id, api_headers, max_wait_seconds, poll_interval_seconds):
-    """Wait (bounded) for a VT analysis to finish. Returns True on completion."""
     polling_deadline = time.time() + max_wait_seconds
     while time.time() < polling_deadline:
         try:
             analysis_response = _safe_request(
                 'GET', f"https://www.virustotal.com/api/v3/analyses/{analysis_id}",
-                headers=api_headers, verify=False)
+                headers=api_headers)
             analysis_status = (((analysis_response.json() or {}).get('data') or {})
                                .get('attributes') or {}).get('status')
             if analysis_status == 'completed':
@@ -872,11 +802,9 @@ def _poll_vt_analysis(analysis_id, api_headers, max_wait_seconds, poll_interval_
 
 
 def _vt_reanalyze_api(api_url, api_headers):
-    """POST {api_url}/analyse to refresh an existing report, then wait (bounded)
-    for the new analysis to finish. Returns True on completion."""
     try:
         reanalyze_response = _safe_request('POST', f"{api_url}/analyse",
-                                           headers=api_headers, verify=False)
+                                           headers=api_headers)
         analysis_id = ((reanalyze_response.json() or {}).get('data') or {}).get('id')
     except (requests.RequestException, ValueError):
         return False
@@ -887,8 +815,6 @@ def _vt_reanalyze_api(api_url, api_headers):
 
 
 def _vt_stale(last_analysis_epoch):
-    """True when VT's last analysis is older than VT_STALE_MAX_AGE_DAYS, so the
-    report is worth refreshing before we trust it."""
     if not last_analysis_epoch:
         return False
     try:
@@ -898,14 +824,10 @@ def _vt_stale(last_analysis_epoch):
 
 
 def vt_submit_url(url, api_headers):
-    """Submit a never-seen URL so an analysis is triggered, then wait (bounded)
-    for it to finish. This mirrors what the VT website's URL-search box does
-    — without this step a brand-new URL returns 404 forever via the read API."""
     try:
         submit_headers = {**api_headers, 'Content-Type': 'application/x-www-form-urlencoded'}
         submit_response = _safe_request('POST', 'https://www.virustotal.com/api/v3/urls',
-                                        headers=submit_headers, data={'url': url},
-                                        verify=False)
+                                        headers=submit_headers, data={'url': url})
         if submit_response.status_code not in (200, 201):
             return False
         analysis_id = ((submit_response.json() or {}).get('data') or {}).get('id')
@@ -923,11 +845,9 @@ def vt_lookup(observable, api_headers, reanalyze=False, allow_submit=False):
                      "reputation": None, "gui": gui_url, "absent": False,
                      "reanalyzed": False, "submitted": False, "stale": False}
 
-    if reanalyze:  # legacy forced pre-fetch reanalyze (off by default)
+    if reanalyze:
         lookup_result["reanalyzed"] = _vt_reanalyze_api(api_url, api_headers)
 
-    # For URLs, VT canonicalizes the URL, so try the normalized id first and the
-    # raw id as a fallback. Domains/IPs have a single endpoint.
     candidate_endpoints = (_vt_url_endpoints(observable) if object_kind == 'urls'
                            else [(api_url, gui_url)])
 
@@ -936,16 +856,14 @@ def vt_lookup(observable, api_headers, reanalyze=False, allow_submit=False):
     for candidate_api_url, candidate_gui_url in candidate_endpoints:
         try:
             candidate_response = _safe_request('GET', candidate_api_url,
-                                               headers=api_headers, verify=False)
+                                               headers=api_headers)
         except (requests.RequestException, ValueError):
             continue
         report_response = candidate_response
         selected_api_url, selected_gui_url = candidate_api_url, candidate_gui_url
         if candidate_response.status_code == 200:
-            break  # found the stored object
+            break
 
-    # URL VT has never seen → submit it (same as the website's search box), wait
-    # for the analysis, then re-fetch the normalized id.
     if ((report_response is None or report_response.status_code == 404)
             and object_kind == 'urls' and allow_submit):
         if vt_submit_url(_vt_normalize_url(observable), api_headers):
@@ -953,7 +871,7 @@ def vt_lookup(observable, api_headers, reanalyze=False, allow_submit=False):
             selected_api_url, selected_gui_url = candidate_endpoints[0]
             try:
                 report_response = _safe_request('GET', selected_api_url,
-                                                headers=api_headers, verify=False)
+                                                headers=api_headers)
             except (requests.RequestException, ValueError):
                 report_response = None
 
@@ -964,14 +882,13 @@ def vt_lookup(observable, api_headers, reanalyze=False, allow_submit=False):
         if report_response.status_code == 200:
             report_data = report_response.json().get('data') or {}
             report_attributes = report_data.get('attributes') or {}
-            # Report older than a year → reanalyze, wait, and re-read it.
             if _vt_stale(report_attributes.get('last_analysis_date')):
                 lookup_result["stale"] = True
                 if _vt_reanalyze_api(selected_api_url, api_headers):
                     lookup_result["reanalyzed"] = True
                     try:
                         refreshed_response = _safe_request('GET', selected_api_url,
-                                                           headers=api_headers, verify=False)
+                                                           headers=api_headers)
                         if refreshed_response.status_code == 200:
                             report_data = refreshed_response.json().get('data') or {}
                             report_attributes = report_data.get('attributes') or {}
@@ -993,14 +910,13 @@ def vt_lookup(observable, api_headers, reanalyze=False, allow_submit=False):
 
 
 def vt_file_lookup(sha256_digest, api_headers):
-    """Read-only VT report for a file hash. Never uploads."""
     lookup_result = {"verdict": "Unknown", "malicious": 0, "suspicious": 0, "total": 0,
                      "gui": f"https://www.virustotal.com/gui/file/{sha256_digest}",
                      "absent": False}
     try:
         file_report_response = _safe_request(
             'GET', f"https://www.virustotal.com/api/v3/files/{sha256_digest}",
-            headers=api_headers, verify=False)
+            headers=api_headers)
         if file_report_response.status_code == 200:
             report_attributes = ((file_report_response.json().get('data') or {})
                                  .get('attributes') or {})
@@ -1029,8 +945,7 @@ def abuseipdb_check(ip_address_text, api_headers):
         abuse_response = _safe_request('GET', 'https://api.abuseipdb.com/api/v2/check',
                                        headers=api_headers,
                                        params={'ipAddress': ip_address_text,
-                                               'maxAgeInDays': ABUSEIPDB_MAX_AGE_DAYS},
-                                       verify=False)
+                                               'maxAgeInDays': ABUSEIPDB_MAX_AGE_DAYS})
         if abuse_response.status_code == 200:
             abuse_data = (abuse_response.json() or {}).get('data') or {}
             check_result.update(score=abuse_data.get('abuseConfidenceScore'),
@@ -1054,9 +969,6 @@ def abuseipdb_check(ip_address_text, api_headers):
 # --- Per-source record builders -----------------------------------------------
 
 def build_url_record(url, urlscan_outcome, private_scan_note=None):
-    """Verdict for a URL comes from URLScan.io (+ its GSB processor).
-    `private_scan_note` carries the escalation reason when the scan was
-    submitted with PRIVATE visibility (keyword / recipient identifier)."""
     scan_result_data = None
     urlscan_field, gsb_field, note, verdict = "n/a", None, None, "Unknown"
     report_url = screenshot_url = None
@@ -1075,8 +987,6 @@ def build_url_record(url, urlscan_outcome, private_scan_note=None):
 
     if scan_result_data is not None:
         screenshot_url = get_screenshot_url(scan_result_data)
-        # Submitted URL vs the URL actually landed on. Recorded for every scan
-        # (a failed one simply has no redirect, so effective_url stays None).
         redirect_chain, hop_initiators = urlscan_redirect_chain(scan_result_data, url)
         if len(redirect_chain) > 1:
             effective_url = redirect_chain[-1]
@@ -1086,10 +996,6 @@ def build_url_record(url, urlscan_outcome, private_scan_note=None):
                               else "same-domain")
             redirect_via = ", ".join(dict.fromkeys(hop_initiators)) or None
         if urlscan_scan_failed(scan_result_data):
-            # urlscan returned a report, but the site itself was never loaded
-            # (the "We could not scan this website!" page). overall.malicious is
-            # false / score 0 only because there was no page to judge — so this
-            # is UNKNOWN, never clean. Two-Source Verification (VT) then decides.
             primary_error = urlscan_primary_error(scan_result_data)
             urlscan_field = (f"could not scan ({primary_error})" if primary_error
                              else "could not scan (site unreachable)")
@@ -1142,8 +1048,6 @@ def build_url_record(url, urlscan_outcome, private_scan_note=None):
 
 
 def build_whitelisted_url_record(url, url_hostname, matched_whitelist_entry):
-    """URL skipped because its host matches an entry in the analyst whitelist
-    (WHITELISTED_DOMAINS) — exactly, or via a '*.'-prefixed wildcard entry."""
     return {'kind': 'url', 'observable': url, 'verdict': "WhitelistSkip",
             'first_source': SRC_WHITELIST,
             'urlscan_field': f"Skipped (host matches {matched_whitelist_entry} in {SRC_WHITELIST})",
@@ -1158,9 +1062,6 @@ def build_whitelisted_url_record(url, url_hostname, matched_whitelist_entry):
 
 
 def build_domain_record(domain, otx_api_headers):
-    """Verdict for a domain comes from AlienVault OTX. Creation date (RDAP) is
-    context only. The OTX whitelist flag is recorded for display but does not
-    drive the URL skip-list (see WHITELISTED_DOMAINS)."""
     otx_result = otx_lookup(domain, otx_api_headers)
     verdict = otx_result['verdict']
     flagged_by = [SRC_OTX] if verdict in ("Suspicious", "Malicious") else []
@@ -1175,7 +1076,6 @@ def build_domain_record(domain, otx_api_headers):
 
 
 def build_ip_record(ip_address_text, abuse_api_headers, is_sender=False):
-    """Verdict for an IP comes from AbuseIPDB."""
     abuse_result = abuseipdb_check(ip_address_text, abuse_api_headers)
     verdict = abuse_result['verdict']
     flagged_by = [SRC_ABUSE] if verdict in ("Suspicious", "Malicious") else []
@@ -1248,8 +1148,6 @@ def format_ip_line(record):
 
 
 def format_two_source_line(record):
-    """Verbose, source-prefixed second-factor line — every piece of data is
-    tagged with where it came from (VirusTotal, RDAP)."""
     vt_result = record['vt']
     line_parts = [f"{SRC_VT} verdict: {vt_result['verdict']}"]
     if not vt_result.get('absent'):
@@ -1290,8 +1188,6 @@ def find_sender_ip(parsed_headers):
 
 
 def collect_ips(parsed_headers):
-    """Public IPs from Received / Authentication-Results / X-*-IP headers, SPF
-    sender first."""
     header_text_parts = []
     for ip_header_name in ('Received', 'Authentication-Results', 'X-Originating-IP',
                            'X-Sender-IP', 'X-SenderIP', 'X-Source-IP'):
@@ -1315,9 +1211,6 @@ def collect_ips(parsed_headers):
 # --- Attachments --------------------------------------------------------------
 
 def hash_attachments(raw_message_bytes):
-    """SHA-256 of MIME parts already inside the message (nothing is
-    downloaded). Parses from *bytes* so binary parts aren't corrupted through a
-    text codec. Inline images (referenced by Content-ID) are hashed too."""
     try:
         parsed_message = email.message_from_bytes(raw_message_bytes)
     except Exception:
@@ -1328,7 +1221,6 @@ def hash_attachments(raw_message_bytes):
             continue
         attachment_filename = message_part.get_filename()
         content_disposition = message_part.get_content_disposition() or ''
-        # Skip the plain-text / HTML body; hash everything else carrying bytes.
         if (message_part.get_content_maintype() == 'text' and not attachment_filename
                 and content_disposition != 'attachment'):
             continue
@@ -1357,11 +1249,26 @@ def decode_qp_for_urls(text):
         return text
 
 
-def collect_observables(raw_header_text, parsed_headers):
+def scan_invisibles(raw_header_text):
     decoded_text = decode_qp_for_urls(raw_header_text)
+    invisible_lines, seen_hits = [], set()
+    for character_index, character in enumerate(decoded_text):
+        if unicodedata.category(character) == 'Cf':
+            character_name = unicodedata.name(character, f"U+{ord(character):04X}")
+            context_window = decoded_text[max(0, character_index - 12):character_index + 12]
+            context_window = context_window.replace(character, '\u27e8?\u27e9')
+            hit_key = (character_name, context_window)
+            if hit_key not in seen_hits:
+                seen_hits.add(hit_key)
+                invisible_lines.append(f"  * {character_name} — near `{defang(context_window)}`")
+    return invisible_lines
+
+
+def collect_observables(raw_header_text, parsed_headers):
+    decoded_text = strip_invisibles(decode_qp_for_urls(raw_header_text))
     found_urls, found_hostnames = set(), set()
     for sender_header_name in ('From', 'Return-Path', 'Reply-To'):
-        sender_domain = extract_domain(parsed_headers.get(sender_header_name, ''))
+        sender_domain = extract_domain(strip_invisibles(parsed_headers.get(sender_header_name, '')))
         if sender_domain:
             found_hostnames.add(sender_domain)
     for raw_url in _URL_RE.findall(decoded_text):
@@ -1381,14 +1288,11 @@ def collect_observables(raw_header_text, parsed_headers):
 
 
 def _is_dangerous_attachment(content_type, filename):
-    """Images / video / audio are merely listed; everything else (pdf, office,
-    archives, executables, scripts, octet-stream, ...) is worth a VT lookup."""
     main_content_type = (content_type or '').split('/')[0].lower()
     return main_content_type not in _SKIPPED_ATTACHMENT_MAINTYPES
 
 
 def _within_one_year(created_iso):
-    """True only for a valid date inside the last DEEPDIVE_MAX_AGE_DAYS days."""
     try:
         year_number, month_number, day_number = map(int, created_iso.split('-'))
         elapsed_days = (date.today() - date(year_number, month_number, day_number)).days
@@ -1398,8 +1302,6 @@ def _within_one_year(created_iso):
 
 
 def _record_created_iso(record):
-    """Creation date for a deep-dive target. IPs don't have one; for a URL we
-    use its registrable domain (RDAP result is cached so it's usually free)."""
     if record.get('kind') == 'ip':
         return None
     if 'created_iso' in record:
@@ -1410,9 +1312,6 @@ def _record_created_iso(record):
 
 
 def deepdive_escalation(vt_result, created_iso, kind='domain'):
-    """Triggers that push an item to NEEDS REVIEW. Each trigger names the
-    source it came from (so 'community score -3' reads as 'VirusTotal
-    community score -3' downstream)."""
     escalation_triggers = []
     vendor_detection_count = ((vt_result.get('malicious') or 0)
                               + (vt_result.get('suspicious') or 0))
@@ -1422,7 +1321,6 @@ def deepdive_escalation(vt_result, created_iso, kind='domain'):
     community_reputation = vt_result.get('reputation')
     if isinstance(community_reputation, int) and community_reputation < 0:
         escalation_triggers.append(f"{SRC_VT} community score {community_reputation}")
-    # RDAP only makes sense for domains/URLs, not IPs.
     if kind != 'ip':
         if not created_iso:
             escalation_triggers.append(f"{SRC_RDAP}: creation date not found")
@@ -1434,23 +1332,6 @@ def deepdive_escalation(vt_result, created_iso, kind='domain'):
 # --- Two-source reconciliation ------------------------------------------------
 
 def two_source_verdict(first_verdict, vt_result, kind):
-    """Reconcile the first-factor verdict with the VirusTotal second factor.
-
-    Severity only ever escalates — a non-clean first factor is NEVER silently
-    downgraded to Clean:
-      * VT (or the first factor) confirms malicious -> Malicious for domains/
-        URLs, Suspicious for IPs.
-      * VT or the first factor is suspicious        -> NeedsReview.
-      * First factor was Unknown and VT came back clean -> NeedsReview (we could
-        not actually scan the item, so a clean VT alone is not enough to clear
-        it — e.g. a URL urlscan could not reach).
-      * First factor was Unknown and VT has no record   -> Unknown (no data at
-        all; never Clean).
-      * First factor was Clean and VT agrees / has no record -> Clean. Only
-        items that were forced through verification (redirect targets, see
-        FORCE_TWO_SOURCE_ON_DISCOVERED) reach this branch with a clean first
-        factor: the page really was loaded and cleared, so a silent VT is not
-        a reason to doubt it."""
     vt_record_absent = vt_result.get('absent')
     vt_verdict = None if vt_record_absent else vt_result.get('verdict')
 
@@ -1460,7 +1341,6 @@ def two_source_verdict(first_verdict, vt_result, kind):
         return 'NeedsReview'
     if first_verdict == 'Clean':
         return 'Clean'
-    # Only an Unknown first factor reaches this point.
     if vt_verdict == 'Clean':
         return 'NeedsReview'
     return 'Unknown'
@@ -1469,8 +1349,6 @@ def two_source_verdict(first_verdict, vt_result, kind):
 # --- Watchlist reason building ------------------------------------------------
 
 def _first_factor_detail(record):
-    """Verbose, source-tagged detail for whichever tool produced the first-
-    factor verdict on this record."""
     if record['kind'] == 'ip':
         abuse_result = record['abuseipdb']
         abuse_confidence_score = abuse_result.get('score', 0) or 0
@@ -1480,7 +1358,6 @@ def _first_factor_detail(record):
         otx_result = record.get('otx', {})
         pulse_count = otx_result.get('pulses', 0) or 0
         return f"{SRC_OTX} ({pulse_count} pulses)"
-    # url
     detail_bits = []
     if record.get('urlscan_field') == 'malicious':
         detail_bits.append(f"{SRC_URLSCAN} flagged malicious")
@@ -1494,9 +1371,6 @@ def _first_factor_detail(record):
 
 
 def build_watchlist_reason(record):
-    """Watchlist reason: every contributing source gets a mention, so a reader
-    can see which tool flagged what, which cleared it, and why it still warrants
-    a look."""
     reason_parts = []
     first_verdict = record['verdict']
     first_factor_text = _first_factor_detail(record)
@@ -1508,7 +1382,6 @@ def build_watchlist_reason(record):
     elif first_verdict == "Clean":
         reason_parts.append(f"First factor clean ({first_factor_text})")
 
-    # Second-factor (VT) signal — present iff Two-Source Verification ran.
     if 'vt' in record:
         vt_result = record['vt']
         if vt_result.get('absent'):
@@ -1519,8 +1392,6 @@ def build_watchlist_reason(record):
             vendor_summary = f"{vt_result.get('malicious', 0)}/{vt_result.get('total', 0)} malicious"
             reason_parts.append(f"{SRC_VT}: {str(vt_result.get('verdict', '')).lower()} ({vendor_summary})")
 
-    # Redirect context: where this URL sent the browser, or which URL it was
-    # discovered from.
     if record.get('effective_url'):
         reason_parts.append(f"{SRC_URLSCAN}: redirects "
                             f"({record.get('redirect_scope') or 'redirect'}) to "
@@ -1530,8 +1401,6 @@ def build_watchlist_reason(record):
         reason_parts.append(f"{SRC_URLSCAN}: {landing_scope}effective URL of "
                             f"{defang(record['discovered_from'])}")
 
-    # For URLs, surface the OTX standing of the parent domain for extra context,
-    # so a reader doesn't have to cross-reference the Domains section.
     if record.get('kind') == 'url' and record.get('domain_otx'):
         domain_otx_result = record['domain_otx']
         apex_domain = record.get('apex') or extract_host(record['observable'])
@@ -1540,8 +1409,6 @@ def build_watchlist_reason(record):
                             f"{domain_otx_result.get('verdict', 'Unknown')} "
                             f"({pulse_count if pulse_count is not None else 0} pulses)")
 
-    # Recency note — covers clean items that only tripped the recency rule, and
-    # adds context when Two-Source didn't already mention it.
     if record.get('recent') and not any('within the last year' in reason_part
                                         for reason_part in reason_parts):
         created_display = _iso_to_ddmmyyyy(record.get('created_iso_dd'))
@@ -1551,9 +1418,6 @@ def build_watchlist_reason(record):
 
 
 def watchlist_verdict(record):
-    """Verdict shown on the watchlist. The two-source combined verdict wins when
-    verification ran; a clean-but-recently-registered item shows NEEDS REVIEW;
-    otherwise the first-factor verdict stands."""
     combined_verdict = record.get('combined_verdict')
     if combined_verdict in ('Malicious', 'Suspicious', 'Unknown', 'NeedsReview'):
         return combined_verdict
@@ -1565,9 +1429,6 @@ def watchlist_verdict(record):
 
 
 def needs_watchlist(record):
-    """An item belongs on the watchlist if ANY source raised a concern (even
-    when a later source disagreed), or if it is a recently-registered
-    domain/URL."""
     if record['verdict'] == 'WhitelistSkip':
         return False
     if record['verdict'] in ('Suspicious', 'Malicious', 'Unknown'):
@@ -1576,18 +1437,12 @@ def needs_watchlist(record):
         return True
     if record.get('recent'):
         return True
-    # A URL that quietly hands the browser to a different registrable domain is
-    # worth an analyst's eyes even when every scanner came back clean — and so
-    # is the landing page on the other side of that redirect.
     if record.get('offsite_redirect') or record.get('offsite_landing'):
         return True
     return False
 
 
 def _attachment_watch_entry(attachment_record):
-    """Build a watchlist row for an attachment with a worrying VT result. Clean
-    attachments and ones we never looked up (image/video/audio) return None and
-    stay off the list."""
     vt_result = attachment_record.get('vt')
     if not vt_result:
         return None
@@ -1606,8 +1461,6 @@ def _attachment_watch_entry(attachment_record):
 # --- Header indicators (anti-spam scores, alignment, display-name) ------------
 
 def get_scl(parsed_headers):
-    """Spam Confidence Level (-1..9): dedicated header first, then the antispam
-    reports."""
     header_value = parsed_headers.get('X-MS-Exchange-Organization-SCL')
     if header_value is not None:
         try:
@@ -1622,7 +1475,6 @@ def get_scl(parsed_headers):
 
 
 def get_bcl(parsed_headers):
-    """Bulk Complaint Level (0..9) from the Microsoft antispam headers."""
     for antispam_header_name in ('X-Microsoft-Antispam', 'X-Forefront-Antispam-Report'):
         bcl_match = _BCL_RE.search(parsed_headers.get(antispam_header_name, '') or '')
         if bcl_match:
@@ -1653,8 +1505,6 @@ def _bcl_label(bcl_value):
 
 
 def _compauth_reason_info(reason_code):
-    """(gloss, emoji) for a Microsoft compauth reason code. Named codes first,
-    otherwise bucketed by the leading digit."""
     reason_code = str(reason_code)
     specific_reason_codes = {
         '000': ('composite auth failed — sender published DMARC and it failed (explicit fail)', '❌'),
@@ -1677,10 +1527,6 @@ def _compauth_reason_info(reason_code):
 
 
 def _dkim_alignment_line(parsed_headers, from_hostname):
-    """DMARC-style DKIM alignment. Compare the FULL From host against each
-    passing DKIM signature's d= host: an exact match is strict alignment; a
-    shared registrable (organizational) domain is relaxed alignment; neither is
-    a misalignment."""
     auth_results_text = " ".join(
         " ".join(parsed_headers.get_all('Authentication-Results') or []).split())
     if not auth_results_text:
@@ -1730,8 +1576,6 @@ def _decode_idna(hostname):
 
 
 def _display_name_flags(display_name, from_registrable_domain):
-    """Brand / look-alike spoofing signals in the From display name: an embedded
-    address or domain whose registrable domain differs from the real sender."""
     spoofing_flags, seen_domains = [], set()
     if not display_name:
         return spoofing_flags
@@ -1755,15 +1599,35 @@ def _display_name_flags(display_name, from_registrable_domain):
     return spoofing_flags
 
 
+def _mixed_script_flags(from_hostname, display_name):
+    spoofing_flags = []
+    candidate_hostnames = set()
+    if from_hostname:
+        candidate_hostnames.add(from_hostname)
+    for mentioned_domain in _DOMAIN_IN_TEXT_RE.findall(display_name or ''):
+        candidate_hostnames.add(mentioned_domain.lower())
+    for candidate_hostname in sorted(candidate_hostnames):
+        scripts = set()
+        for character in candidate_hostname:
+            if character.isalpha():
+                try:
+                    scripts.add(unicodedata.name(character).split()[0])
+                except ValueError:
+                    pass
+        interesting = scripts & {"LATIN", "CYRILLIC", "GREEK"}
+        if len(interesting) > 1:
+            spoofing_flags.append(f"mixed-script host {defang(candidate_hostname)} "
+                                  f"({', '.join(sorted(interesting)).title()}) "
+                                  f"— possible homograph / look-alike")
+    return spoofing_flags
+
+
 def _punycode_flags(from_hostname, display_name):
-    """Flag punycode / IDN domains (xn--) in the sender or display name and
-    decode them, so a homograph look-alike is visible to the analyst."""
     spoofing_flags, candidate_hostnames = [], set()
     if from_hostname:
         candidate_hostnames.add(from_hostname)
     for mentioned_domain in _DOMAIN_IN_TEXT_RE.findall(display_name or ''):
         candidate_hostnames.add(mentioned_domain.lower())
-    # sorted() so multiple hits are always reported in a deterministic order
     for candidate_hostname in sorted(candidate_hostnames):
         if any(hostname_label.startswith('xn--')
                for hostname_label in candidate_hostname.split('.')):
@@ -1775,15 +1639,23 @@ def _punycode_flags(from_hostname, display_name):
 
 
 def build_indicators_block(parsed_headers):
-    """Anti-spam scores + alignment + display-name checks. Returns a list of
-    already-defanged markdown lines, or [] if there's nothing to show."""
     indicator_lines = []
-    from_display_name, from_address = parseaddr(parsed_headers.get('From', '') or '')
+    raw_from_header = parsed_headers.get('From', '') or ''
+
+    invisible_names = invisible_char_names(raw_from_header)
+    sanitised_from_header = strip_invisibles(raw_from_header)
+
+    from_display_name, from_address = parseaddr(sanitised_from_header)
     from_display_name = decode_mime_words(from_display_name) if from_display_name else ''
     if from_display_name == "Not Found":
         from_display_name = ''
+    from_display_name = strip_invisibles(from_display_name)
     from_hostname = from_address.split('@')[-1].lower() if '@' in from_address else ''
     from_registrable = registrable_domain(from_hostname)
+
+    if invisible_names:
+        indicator_lines.append(f"* **Invisible characters:** {', '.join(invisible_names)} "
+                               f"in From 📛 — evasion attempt (zero-width / bidi / format chars)")
 
     scl_value = get_scl(parsed_headers)
     if scl_value is not None:
@@ -1797,9 +1669,9 @@ def build_indicators_block(parsed_headers):
         indicator_lines.append(alignment_line)
 
     return_path_domain = registrable_domain(
-        extract_domain(parsed_headers.get('Return-Path', '')) or '')
+        extract_domain(strip_invisibles(parsed_headers.get('Return-Path', ''))) or '')
     reply_to_domain = registrable_domain(
-        extract_domain(parsed_headers.get('Reply-To', '')) or '')
+        extract_domain(strip_invisibles(parsed_headers.get('Reply-To', ''))) or '')
     if return_path_domain:
         if return_path_domain == from_registrable:
             indicator_lines.append(f"* **From ↔ Return-Path:** aligned ✅ "
@@ -1818,7 +1690,8 @@ def build_indicators_block(parsed_headers):
                                    f"{defang(reply_to_domain)})")
 
     spoofing_flags = (_display_name_flags(from_display_name, from_registrable)
-                      + _punycode_flags(from_hostname, from_display_name))
+                      + _punycode_flags(from_hostname, from_display_name)
+                      + _mixed_script_flags(from_hostname, from_display_name))
     if spoofing_flags:
         indicator_lines.append("* **Display-name check:** spoofing indicators 📛")
         for spoofing_flag in spoofing_flags:
@@ -1831,16 +1704,11 @@ def build_indicators_block(parsed_headers):
     return indicator_lines
 
 
-# --- URL scanning batches (used once for the email's URLs, then once per
-# --- round of effective-URL discovery) -----------------------------------------
+# --- URL scanning batches ---------------------------------------------------
 
 def submit_url_batch(urls_to_scan, api_headers, recipient_tokens,
                      exact_whitelist_hosts, wildcard_whitelist_suffixes,
                      throttle_first=False):
-    """Submit a batch of URLs to URLScan.io. Order of checks per URL:
-    (1) whitelist skip, (2) private-scan escalation (keyword / recipient
-    identifier -> "private" visibility), (3) submission. `throttle_first` waits
-    before the first submission too, which is what a follow-up round wants."""
     pending_submissions = {}
     needs_throttle = throttle_first
     for url_observable in urls_to_scan:
@@ -1849,8 +1717,8 @@ def submit_url_batch(urls_to_scan, api_headers, recipient_tokens,
             continue
         escalation_reason = private_scan_reason(url_observable, recipient_tokens)
         scan_visibility = "private" if escalation_reason else "unlisted"
-        if needs_throttle:                       # throttle BETWEEN submissions only —
-            time.sleep(URLSCAN_SUBMIT_THROTTLE)  # no wasted sleep after the last one
+        if needs_throttle:
+            time.sleep(URLSCAN_SUBMIT_THROTTLE)
         needs_throttle = True
         pending_submissions[url_observable] = {
             'outcome': submit_scan(url_observable, api_headers,
@@ -1863,9 +1731,6 @@ def submit_url_batch(urls_to_scan, api_headers, recipient_tokens,
 def build_url_record_batch(urls_to_scan, pending_submissions,
                            exact_whitelist_hosts, wildcard_whitelist_suffixes,
                            discovered_from=None):
-    """Poll and turn a submitted batch into records. `discovered_from` maps a
-    URL to the URL that redirected to it; those records are marked so they can
-    be labelled in the report and forced through Two-Source Verification."""
     url_records = []
     for url_observable in urls_to_scan:
         url_hostname = extract_host(url_observable)
@@ -1890,10 +1755,6 @@ def build_url_record_batch(urls_to_scan, pending_submissions,
 
 
 def next_effective_urls(source_records, already_seen_urls, remaining_budget):
-    """Effective URLs worth scanning in their own right, taken from a batch of
-    freshly built records: the landing page differs from what was submitted,
-    nothing has scanned it yet, and it is a sane target. Returns
-    (urls, discovered_from) — the second mapping each new URL to its parent."""
     discovered_urls, discovered_from = [], {}
     if not FOLLOW_EFFECTIVE_URLS or remaining_budget <= 0:
         return discovered_urls, discovered_from
@@ -1924,10 +1785,6 @@ def run_osint(parsed_headers, url_observables, domain_observables, raw_message_b
     domain_records = [build_domain_record(domain_observable, otx_api_headers)
                       for domain_observable in domain_observables]
 
-    # The URL skip-list is the analyst-maintained whitelist, NOT OTX's whitelist.
-    # OTX's whitelisted flag is still surfaced on each domain line for context.
-    # Exact entries match one host; '*.'-prefixed entries cover the apex and
-    # every subdomain (see _build_whitelist).
     exact_whitelist_hosts, wildcard_whitelist_suffixes = _build_whitelist(WHITELISTED_DOMAINS)
 
     print("### Domains")
@@ -1947,9 +1804,6 @@ def run_osint(parsed_headers, url_observables, domain_observables, raw_message_b
                                          exact_whitelist_hosts,
                                          wildcard_whitelist_suffixes)
 
-    # --- Effective-URL discovery: a URL that redirects has a landing page no
-    # source has looked at yet, so scan that landing page as its own observable
-    # (URLScan.io now, VirusTotal forced later, OTX for a new apex domain).
     seen_url_keys = {_canonical_url(url_observable) for url_observable in url_observables}
     discovery_budget = DISCOVERY_MAX_URLS
     frontier_records = url_records
@@ -1980,9 +1834,6 @@ def run_osint(parsed_headers, url_observables, domain_observables, raw_message_b
     else:
         print("*No URLs found.*")
 
-    # --- Domains reached only through a redirect: an off-domain landing page
-    # introduces an apex domain the email never mentioned, so give it the same
-    # OTX/RDAP treatment as any other domain instead of leaving it unexamined.
     known_apex_domains = {domain_record['observable'] for domain_record in domain_records}
     redirect_domain_records = []
     for discovered_record in discovered_url_records:
@@ -2014,15 +1865,10 @@ def run_osint(parsed_headers, url_observables, domain_observables, raw_message_b
     for ip_record in _sort_records(ip_records):
         print(format_ip_line(ip_record))
 
-    # --- Two-Source Verification: push every non-clean first-factor item
-    # (URL / domain / IP) through VirusTotal as the independent second source.
     print("---")
     print("### Two-Source Verification")
     print("---")
 
-    # Non-clean first-factor items always qualify; redirect targets are pushed
-    # through even when URLScan.io cleared them (force_two_source), because a
-    # landing page nobody expected deserves a second opinion.
     verification_candidates = [record for record in (domain_records + url_records + ip_records)
                                if record['verdict'] in ('Malicious', 'Suspicious', 'Unknown')
                                or record.get('force_two_source')]
@@ -2082,8 +1928,8 @@ def run_osint(parsed_headers, url_observables, domain_observables, raw_message_b
                            f"SHA-256: `{attachment_record['sha256']}`")
         if _is_dangerous_attachment(attachment_record['content_type'],
                                     attachment_record['filename']):
-            if vt_file_lookup_done:          # throttle BETWEEN VT file lookups only,
-                time.sleep(VT_THROTTLE)      # not before the first one
+            if vt_file_lookup_done:
+                time.sleep(VT_THROTTLE)
             vt_file_lookup_done = True
             file_vt_result = vt_file_lookup(attachment_record['sha256'], vt_api_headers)
             attachment_record['vt'] = file_vt_result
@@ -2100,10 +1946,6 @@ def run_osint(parsed_headers, url_observables, domain_observables, raw_message_b
     print(f"### {WATCHLIST_PREVIEW_TITLE}")
     print("---")
 
-    # A recently-registered domain/URL belongs on the watchlist even when every
-    # scanner came back clean, so compute recency for all domain/URL records
-    # (creation date is cached, so this is essentially free). IPs have none.
-    # While here, attach each URL's parent-domain OTX standing for context.
     otx_results_by_apex = {domain_record['observable']: domain_record.get('otx')
                            for domain_record in domain_records}
     for record in domain_records + url_records:
@@ -2146,9 +1988,6 @@ def run_osint(parsed_headers, url_observables, domain_observables, raw_message_b
     else:
         print("*Nothing on the watchlist.*")
 
-    # --- Watchlist Review: the same items again, observable + machine verdict
-    # only (no reasoning), for the analyst to re-verdict by hand after manually
-    # checking each artifact.
     print("---")
     print(f"### {WATCHLIST_REVIEW_TITLE}")
     print("---")
@@ -2163,6 +2002,11 @@ def run_osint(parsed_headers, url_observables, domain_observables, raw_message_b
 def analyze_headers(raw_header_text, raw_message_bytes=None):
     if raw_message_bytes is None:
         raw_message_bytes = raw_header_text.encode('utf-8', 'surrogateescape')
+
+    if len(raw_header_text) > MAX_INPUT_BYTES:
+        raw_header_text = raw_header_text[:MAX_INPUT_BYTES]
+        print(f"> ⚠️ Input truncated to {MAX_INPUT_BYTES:,} chars for analysis.\n")
+
     parsed_headers = HeaderParser().parsestr(raw_header_text)
 
     print("# Headers Analysis")
@@ -2174,13 +2018,13 @@ def analyze_headers(raw_header_text, raw_message_bytes=None):
     print(f"* **Date:** {convert_to_utc(parsed_headers.get('Date', 'Not Found'))}")
     print(f"* **Reply-To:** {defang(decode_mime_words(parsed_headers.get('Reply-To', 'Not Found')))}")
     print(f"* **Return-Path:** {defang(decode_mime_words(parsed_headers.get('Return-Path', 'Not Found')))}")
-    print(f"* **Message-ID:** {' '.join(parsed_headers.get('Message-ID', 'Not Found').split())}")
+    print(f"* **Message-ID:** {strip_terminal_controls(' '.join(parsed_headers.get('Message-ID', 'Not Found').split()))}")
     print("---")
     print("## Authentication Results")
     print("---")
     print("```")
-    print(parse_auth_results(" ".join(parsed_headers.get('Authentication-Results',
-                                                         'Not Found').split())))
+    print(parse_auth_results(strip_terminal_controls(
+        " ".join(parsed_headers.get('Authentication-Results', 'Not Found').split()))))
     print("```")
     print("---")
 
@@ -2192,6 +2036,16 @@ def analyze_headers(raw_header_text, raw_message_bytes=None):
             print(indicator_line)
         print("---")
 
+    invisible_hits = scan_invisibles(raw_header_text)
+    if invisible_hits:
+        print("## Invisible / Format Characters")
+        print("---")
+        print("* **Detected in message body/headers 📛** — evasion attempt "
+              "(zero-width / bidi / format chars):")
+        for invisible_hit in invisible_hits:
+            print(invisible_hit)
+        print("---")
+
     url_observables, domain_observables = collect_observables(raw_header_text, parsed_headers)
     print("## OSINT Lookups")
     print("---")
@@ -2199,9 +2053,17 @@ def analyze_headers(raw_header_text, raw_message_bytes=None):
 
 
 if __name__ == "__main__":
+    missing_env = [env_var for env_var in _REQUIRED_ENV if not os.getenv(env_var)]
+    if missing_env:
+        print(f"Missing required environment variables: {', '.join(missing_env)}",
+              file=sys.stderr)
+        print("Set them (e.g. in your .env) before running.", file=sys.stderr)
+        sys.exit(1)
+
     print("Paste the raw email below.")
     print("Tip: paste the FULL message (headers + body) so attachments can be hashed; "
           "headers-only also works for everything except attachment hashing.")
+    print("Or run non-interactively:  python header_analyzer.py < sample.eml")
     print("When finished, press Enter to go to a new line, then press Ctrl+D to run the analysis:\n")
     raw_message_bytes = sys.stdin.buffer.read()
     raw_input_text = raw_message_bytes.decode('utf-8', errors='surrogateescape')
