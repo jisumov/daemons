@@ -370,6 +370,72 @@ def registrable_domain(hostname):
     return None
 
 
+_CONFUSABLE_SCRIPTS = {'LATIN', 'CYRILLIC', 'GREEK', 'ARMENIAN', 'CHEROKEE'}
+
+
+def _label_scripts(label):
+    label_scripts = set()
+    for character in label:
+        if character.isalpha():
+            try:
+                label_scripts.add(unicodedata.name(character).split()[0])
+            except ValueError:
+                pass
+    return label_scripts
+
+
+def _idna_encode(hostname):
+    try:
+        return hostname.encode('idna').decode('ascii')
+    except Exception:
+        return None
+
+
+@functools.lru_cache(maxsize=None)
+def normalized_host(hostname):
+    if not hostname:
+        return None, ()
+    normalization_flags = []
+    nfkc_form = unicodedata.normalize('NFKC', hostname)
+    normalized = nfkc_form.strip().lower().rstrip('.')
+    if nfkc_form != hostname:
+        normalization_flags.append(
+            f"compatibility chars normalized (NFKC): "
+            f"{defang(hostname)} → {defang(normalized)}")
+    for label in normalized.split('.'):
+        mixed = _label_scripts(label) & _CONFUSABLE_SCRIPTS
+        if len(mixed) > 1:
+            normalization_flags.append(
+                f"mixed-script label \"{defang(label)}\" "
+                f"({'+'.join(sorted(mixed))}) — possible homoglyph")
+            break
+    if normalized.isascii():
+        return normalized, tuple(normalization_flags)
+    punycode = _idna_encode(normalized)
+    if punycode:
+        if normalization_flags:
+            normalization_flags.append(f"scannable form: {punycode}")
+        return punycode, tuple(normalization_flags)
+    return None, tuple(normalization_flags)
+
+
+def _rehost_url(url, new_host):
+    try:
+        parsed_url = urlparse(url)
+        new_netloc = new_host
+        if parsed_url.port:
+            new_netloc = f"{new_host}:{parsed_url.port}"
+        if parsed_url.username:
+            userinfo = parsed_url.username
+            if parsed_url.password:
+                userinfo += f":{parsed_url.password}"
+            new_netloc = f"{userinfo}@{new_netloc}"
+        return urlunparse((parsed_url.scheme, new_netloc, parsed_url.path or '',
+                           parsed_url.params, parsed_url.query, parsed_url.fragment))
+    except (ValueError, UnicodeError):
+        return url
+
+
 def _build_whitelist(whitelist_entries):
     exact_hosts, wildcard_suffixes = set(), set()
     for whitelist_entry in whitelist_entries:
@@ -420,9 +486,11 @@ def collect_recipient_tokens(parsed_headers):
 
 
 def private_scan_reason(url, recipient_tokens):
-    lowered_url_forms = {url.lower()}
+    lowered_url_forms = {url.lower(), unicodedata.normalize('NFKC', url).lower()}
     try:
-        lowered_url_forms.add(unquote(url).lower())
+        decoded_url = unquote(url)
+        lowered_url_forms.add(decoded_url.lower())
+        lowered_url_forms.add(unicodedata.normalize('NFKC', decoded_url).lower())
     except Exception:
         pass
     for scan_keyword in sorted(PRIVATE_SCAN_KEYWORDS):
@@ -1267,24 +1335,39 @@ def scan_invisibles(raw_header_text):
 def collect_observables(raw_header_text, parsed_headers):
     decoded_text = strip_invisibles(decode_qp_for_urls(raw_header_text))
     found_urls, found_hostnames = set(), set()
+    lookalike_notes, seen_note_keys = [], set()
+
+    def record_flags(original_host, host_flags):
+        for host_flag in host_flags:
+            note_key = (original_host, host_flag)
+            if note_key not in seen_note_keys:
+                seen_note_keys.add(note_key)
+                lookalike_notes.append(f"  * {defang(original_host)}: {host_flag}")
+
     for sender_header_name in ('From', 'Return-Path', 'Reply-To'):
         sender_domain = extract_domain(strip_invisibles(parsed_headers.get(sender_header_name, '')))
         if sender_domain:
-            found_hostnames.add(sender_domain)
+            scannable_host, host_flags = normalized_host(sender_domain)
+            record_flags(sender_domain, host_flags)
+            found_hostnames.add(scannable_host or sender_domain)
     for raw_url in _URL_RE.findall(decoded_text):
         cleaned_url = raw_url.rstrip('.,;:!?)]([\'"<>')
         unwrapped_target_url = unwrap_safelink(cleaned_url)
         if unwrapped_target_url:
             cleaned_url = unwrapped_target_url
-        found_urls.add(cleaned_url)
         url_hostname = extract_host(cleaned_url)
         if url_hostname:
-            found_hostnames.add(url_hostname)
+            scannable_host, host_flags = normalized_host(url_hostname)
+            record_flags(url_hostname, host_flags)
+            if scannable_host and scannable_host != url_hostname:
+                cleaned_url = _rehost_url(cleaned_url, scannable_host)
+            found_hostnames.add(scannable_host or url_hostname)
+        found_urls.add(cleaned_url)
     url_observables = sorted(found_url for found_url in found_urls if is_scannable(found_url))
     domain_observables = {apex_domain for found_hostname in found_hostnames
                           if (apex_domain := registrable_domain(found_hostname))
                           and is_scannable(apex_domain)}
-    return url_observables, sorted(domain_observables)
+    return url_observables, sorted(domain_observables), lookalike_notes
 
 
 def _is_dangerous_attachment(content_type, filename):
@@ -2046,7 +2129,16 @@ def analyze_headers(raw_header_text, raw_message_bytes=None):
             print(invisible_hit)
         print("---")
 
-    url_observables, domain_observables = collect_observables(raw_header_text, parsed_headers)
+    url_observables, domain_observables, lookalike_notes = collect_observables(
+        raw_header_text, parsed_headers)
+    if lookalike_notes:
+        print("## Look-alike / Normalized Hosts")
+        print("---")
+        print("* **Host normalization applied 📛** — homoglyph / compatibility "
+              "characters detected and mapped to their scannable form:")
+        for lookalike_note in lookalike_notes:
+            print(lookalike_note)
+        print("---")
     print("## OSINT Lookups")
     print("---")
     run_osint(parsed_headers, url_observables, domain_observables, raw_message_bytes)
