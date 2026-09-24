@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "socio"
-version = "0.1.0"
+version = "0.1.1"
 description = "SOC I/O: cybersecurity tools for accelerating triage based on OSINT APIs"
 readme = "README.md"
 requires-python = ">=3.12"
