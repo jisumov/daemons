@@ -1,0 +1,19 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "socio"
+version = "0.1.0"
+description = "SOC I/O: cybersecurity tools for accelerating triage based on OSINT APIs"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "MIT"
+authors = [{ name = "José Suárez", email = "jisumov@gmail.com" }]
+dependencies = []
+
+[project.urls]
+Repository = "https://github.com/jisumov/socio"
+
+[project.scripts]
+socio = "socio.cli:main"
