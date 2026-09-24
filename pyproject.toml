@@ -17,3 +17,6 @@ Repository = "https://github.com/jisumov/socio"
 
 [project.scripts]
 socio = "socio.cli:main"
+
+[tool.hatch.build.targets.sdist]
+exclude = ["socio.png"]
